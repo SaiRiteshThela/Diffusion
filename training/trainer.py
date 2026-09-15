@@ -41,14 +41,34 @@ class Trainer(ABC):
     def plot_trajectory(self, step: int, **kwargs) -> Path | None:
         return None
 
-    def get_optimizer(self, lr: float):
-        return torch.optim.Adam(self.model.parameters(), lr=lr)
+    def get_optimizer(
+        self,
+        lr: float,
+        optimizer_name: str = "adam",
+        weight_decay: float = 0.0,
+    ) -> torch.optim.Optimizer:
+        optimizers = {
+            "adam": torch.optim.Adam,
+            "adamw": torch.optim.AdamW,
+        }
+        if optimizer_name not in optimizers:
+            raise ValueError(
+                f"unknown optimizer {optimizer_name!r}, expected one of {sorted(optimizers)}"
+            )
+        return optimizers[optimizer_name](
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
 
     def train(
         self,
         num_steps: int,
         device: torch.device,
         lr: float = 1e-3,
+        optimizer_name: str = "adam",
+        weight_decay: float = 0.0,
+        max_grad_norm: float | None = None,
         ckpt_path: str | Path | None = None,
         checkpoint_every: int = 50,
         val_every: int = 50,
@@ -71,7 +91,7 @@ class Trainer(ABC):
         print(f"Training model with size: {size_b / MiB:.3f} MiB")
 
         self.model.to(device)
-        opt = self.get_optimizer(lr)
+        opt = self.get_optimizer(lr, optimizer_name, weight_decay)
         start_step = 0
         train_losses: list[Tensor] = []
         val_losses: list[Tensor] = []
@@ -90,6 +110,9 @@ class Trainer(ABC):
                     f"checkpoint step {start_step} exceeds requested num_steps {num_steps}"
                 )
             print(f"resumed {resume_from} at step {start_step}")
+
+        best_train_loss = min((value.item() for value in train_losses), default=float("inf"))
+        best_val_loss = min((value.item() for value in val_losses), default=float("inf"))
 
         def history() -> dict[str, Tensor]:
             train = torch.stack(train_losses).cpu() if train_losses else torch.empty(0)
@@ -112,10 +135,34 @@ class Trainer(ABC):
                     "step": step,
                     "num_steps": num_steps,
                     "lr": lr,
+                    "optimizer_name": optimizer_name,
+                    "weight_decay": weight_decay,
+                    "max_grad_norm": max_grad_norm,
                     "train_kwargs": kwargs,
                 },
                 output,
             )
+
+        if start_step == 0 and val_every > 0:
+            self.model.eval()
+            initial_values = [
+                self.get_val_loss(**kwargs)
+                for _ in range(val_batches)
+            ]
+            initial_values = [value for value in initial_values if value is not None]
+            if initial_values:
+                initial_val = torch.stack(initial_values).mean()
+                val_losses.append(initial_val.detach().cpu())
+                val_steps.append(0)
+                best_val_loss = initial_val.item()
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "loss/val": initial_val.item(),
+                            "loss/val_best": best_val_loss,
+                        },
+                        step=0,
+                    )
 
         last_step = start_step
         try:
@@ -125,12 +172,18 @@ class Trainer(ABC):
                 opt.zero_grad()
                 loss = self.get_train_loss(**kwargs)
                 loss.backward()
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                 opt.step()
                 train_losses.append(loss.detach().cpu())
+                best_train_loss = min(best_train_loss, loss.item())
                 last_step = step
 
                 desc = f"Step {step}, train: {loss.item():.3f}"
-                log_data: dict[str, Any] = {"loss/train": loss.item()}
+                log_data: dict[str, Any] = {
+                    "loss/train": loss.item(),
+                    "loss/train_best": best_train_loss,
+                }
                 if val_every > 0 and step % val_every == 0:
                     self.model.eval()
                     values = [
@@ -142,8 +195,10 @@ class Trainer(ABC):
                         val = torch.stack(values).mean()
                         val_losses.append(val.detach().cpu())
                         val_steps.append(step)
+                        best_val_loss = min(best_val_loss, val.item())
                         desc += f", val: {val.item():.3f}"
                         log_data["loss/val"] = val.item()
+                        log_data["loss/val_best"] = best_val_loss
 
                 if plot_every > 0 and step % plot_every == 0:
                     self.model.eval()

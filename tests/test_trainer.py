@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -21,6 +22,14 @@ def _path(channels: int = 1, size: int = 4):
 def test_model_size_b():
     linear = nn.Linear(4, 4)
     assert model_size_b(linear) == sum(p.numel() * p.element_size() for p in linear.parameters())
+
+
+def test_optimizer_selection():
+    trainer = FlowTrainer(_path(), TinyFlow())
+    assert isinstance(trainer.get_optimizer(1e-3, "adam"), torch.optim.Adam)
+    assert isinstance(trainer.get_optimizer(1e-3, "adamw"), torch.optim.AdamW)
+    with pytest.raises(ValueError, match="unknown optimizer"):
+        trainer.get_optimizer(1e-3, "sgd")
 
 
 def test_flow_trainer_loss_is_finite_and_trainable():
@@ -66,11 +75,11 @@ def test_flow_trainer_train_and_checkpoint(tmp_path: Path):
         wandb_run=FakeRun(),
     )
     assert hist["train"].shape == (2,)
-    assert hist["val"].shape == (2,)
-    assert hist["val_steps"].tolist() == [1, 2]
+    assert hist["val"].shape == (3,)
+    assert hist["val_steps"].tolist() == [0, 1, 2]
     assert not model.training
     assert list(samples.glob("traj_step_*.png"))
-    assert [step for _, step in logged] == [1, 2]
+    assert [step for _, step in logged] == [0, 1, 2]
     assert "loss/train" in logged[-1][0]
     assert "loss/val" in logged[-1][0]
     assert "samples/trajectory" in logged[-1][0]
@@ -96,7 +105,7 @@ def test_flow_trainer_train_and_checkpoint(tmp_path: Path):
         resume_from=ckpt,
     )
     assert resumed_hist["train"].shape == (3,)
-    assert resumed_hist["val_steps"].tolist() == [1, 2, 3]
+    assert resumed_hist["val_steps"].tolist() == [0, 1, 2, 3]
 
 
 def test_flow_trainer_val_loss():

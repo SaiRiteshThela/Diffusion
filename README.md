@@ -49,3 +49,9 @@ both cells. The
 trainer periodically records validation loss, writes checkpoints under
 `checkpoints/`, saves trajectories under `samples/`, and logs losses and
 trajectory grids to the `mnist-flow-matching` W&B project.
+
+`experiments/experiment_2.ipynb` runs a 30-trial W&B Bayesian sweep over the
+U-Net architecture and optimizer settings, minimizing the running-best
+validation loss. It then retrains the winning configuration for 5,000 steps for
+a fair comparison with Experiment 1. Sweep checkpoints persist under
+`/workspace-global/Diffusion-data/checkpoints/experiment_2`.
