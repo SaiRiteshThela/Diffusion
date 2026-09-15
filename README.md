@@ -55,3 +55,9 @@ U-Net architecture and optimizer settings, minimizing the running-best
 validation loss. It then retrains the winning configuration for 5,000 steps for
 a fair comparison with Experiment 1. Sweep checkpoints persist under
 `/workspace-global/Diffusion-data/checkpoints/experiment_2`.
+
+Generate 25 samples from the Experiment 2 winner with 1,000 Euler steps:
+
+```bash
+uv run python -m sampling.generate_experiment_2
+```
