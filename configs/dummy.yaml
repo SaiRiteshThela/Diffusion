@@ -1,0 +1,23 @@
+# Dummy config for local shape tests. Not a training recipe.
+
+time_embedding:
+  time_emb_dim: 128
+  scaled_time_emb_dim: 256
+
+unet:
+  in_channels: 3
+  start_dim: 64
+  dim_mults: [1, 2, 4]
+  residual_blocks_per_group: 1
+  group_norm_num_groups: 16
+  time_emb_dim: 256
+  n_heads: 4
+  d_ff: 256
+  attn_dropout: 0.1
+  ffn_dropout: 0.1
+  proj_dropout: 0.1
+  activation: gelu
+
+test:
+  batch_size: 2
+  image_size: 32

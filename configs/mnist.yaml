@@ -1,0 +1,24 @@
+# Unconditional MNIST flow matching (1x32x32, values in [-1, 1]).
+
+time_embedding:
+  time_emb_dim: 128
+  scaled_time_emb_dim: 256
+
+unet:
+  in_channels: 1
+  start_dim: 64
+  dim_mults: [1, 2, 4]
+  residual_blocks_per_group: 1
+  group_norm_num_groups: 16
+  time_emb_dim: 256
+  n_heads: 4
+  d_ff: 256
+  # Keep train and validation CFM losses directly comparable.
+  attn_dropout: 0.0
+  ffn_dropout: 0.0
+  proj_dropout: 0.0
+  activation: gelu
+
+test:
+  batch_size: 2
+  image_size: 32
