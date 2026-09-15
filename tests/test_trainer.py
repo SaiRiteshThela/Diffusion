@@ -42,6 +42,12 @@ def test_flow_trainer_train_and_checkpoint(tmp_path: Path):
     model = TinyFlow()
     ckpt = tmp_path / "flow.pt"
     samples = tmp_path / "samples"
+    logged = []
+
+    class FakeRun:
+        def log(self, data, step):
+            logged.append((data, step))
+
     trainer = FlowTrainer(path, model, val_path=val_path)
     hist = trainer.train(
         num_steps=2,
@@ -57,12 +63,17 @@ def test_flow_trainer_train_and_checkpoint(tmp_path: Path):
         n_plot_steps=3,
         samples_dir=samples,
         show_plots=False,
+        wandb_run=FakeRun(),
     )
     assert hist["train"].shape == (2,)
     assert hist["val"].shape == (2,)
     assert hist["val_steps"].tolist() == [1, 2]
     assert not model.training
     assert list(samples.glob("traj_step_*.png"))
+    assert [step for _, step in logged] == [1, 2]
+    assert "loss/train" in logged[-1][0]
+    assert "loss/val" in logged[-1][0]
+    assert "samples/trajectory" in logged[-1][0]
     saved = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert "model" in saved
     assert "optimizer" in saved

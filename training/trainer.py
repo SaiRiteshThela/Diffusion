@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
+import wandb
 from matplotlib import pyplot as plt
 from torch import Tensor
 from torchvision.utils import make_grid
@@ -36,7 +38,7 @@ class Trainer(ABC):
     def get_val_loss(self, **kwargs) -> Tensor | None:
         return None
 
-    def plot_trajectory(self, step: int, **kwargs) -> None:
+    def plot_trajectory(self, step: int, **kwargs) -> Path | None:
         return None
 
     def get_optimizer(self, lr: float):
@@ -57,6 +59,7 @@ class Trainer(ABC):
         samples_dir: str | Path = "samples",
         show_plots: bool = True,
         resume_from: str | Path | None = None,
+        wandb_run: Any | None = None,
         **kwargs,
     ) -> dict[str, Tensor]:
         if num_steps < 1:
@@ -127,6 +130,7 @@ class Trainer(ABC):
                 last_step = step
 
                 desc = f"Step {step}, train: {loss.item():.3f}"
+                log_data: dict[str, Any] = {"loss/train": loss.item()}
                 if val_every > 0 and step % val_every == 0:
                     self.model.eval()
                     values = [
@@ -139,19 +143,27 @@ class Trainer(ABC):
                         val_losses.append(val.detach().cpu())
                         val_steps.append(step)
                         desc += f", val: {val.item():.3f}"
+                        log_data["loss/val"] = val.item()
 
                 if plot_every > 0 and step % plot_every == 0:
                     self.model.eval()
-                    self.plot_trajectory(
+                    trajectory_path = self.plot_trajectory(
                         step=step,
                         n_images=n_plot_images,
                         n_steps=n_plot_steps,
                         samples_dir=samples_dir,
                         show=show_plots,
                     )
+                    if wandb_run is not None and trajectory_path is not None:
+                        log_data["samples/trajectory"] = wandb.Image(
+                            str(trajectory_path),
+                            caption=f"Step {step}: noise to MNIST",
+                        )
 
                 if checkpoint_every > 0 and step % checkpoint_every == 0:
                     save_checkpoint(step)
+                if wandb_run is not None:
+                    wandb_run.log(log_data, step=step)
                 pbar.set_description(desc)
         except KeyboardInterrupt:
             save_checkpoint(last_step)
@@ -202,7 +214,7 @@ class FlowTrainer(Trainer):
         n_steps: int = 10,
         samples_dir: str | Path = "samples",
         show: bool = True,
-    ) -> None:
+    ) -> Path:
         device = next(self.model.parameters()).device
         x0, _ = self.path.p_simple.sample(n_images)
         ts = (
@@ -227,3 +239,4 @@ class FlowTrainer(Trainer):
         if show:
             plt.show()
         plt.close(fig)
+        return out

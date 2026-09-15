@@ -11,7 +11,7 @@ U-Net.
 - `sampling/` — ODE interfaces and Euler integration
 - `configs/` — model configurations
 - `tests/` — unit and integration tests
-- `dev.ipynb` — model setup and an interactive MNIST training run
+- `experiments/` — numbered experiment notebooks
 
 ## Setup
 
@@ -27,6 +27,9 @@ uv run pytest
 
 ## Training
 
-Open `dev.ipynb` with the `Python (diffusion)` kernel and run both cells. The
+Sign in to Weights & Biases once with `uv run wandb login`, then open
+`experiments/experiment_1.ipynb` with the `Python (diffusion)` kernel and run
+both cells. The
 trainer periodically records validation loss, writes checkpoints under
-`checkpoints/`, and saves trajectories under `samples/`.
+`checkpoints/`, saves trajectories under `samples/`, and logs losses and
+trajectory grids to the `mnist-flow-matching` W&B project.
