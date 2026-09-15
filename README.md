@@ -19,6 +19,22 @@ U-Net.
 uv sync --dev
 ```
 
+## RunPod
+
+Use the pod disk for the active checkout and virtual environment, and the
+GeeseFS global volume for persistent data:
+
+```bash
+bash /workspace-global/bootstrap-diffusion.sh
+cd /workspace/Diffusion
+```
+
+The bootstrap script restores GitHub access, clones or updates the repository,
+installs `uv`, and creates the environment on the fast pod disk. Training data,
+checkpoints, samples, and W&B files are written beneath
+`/workspace-global/Diffusion-data`. Override that location with
+`DIFFUSION_DATA_ROOT`.
+
 ## Tests
 
 ```bash
