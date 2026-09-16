@@ -24,18 +24,20 @@ unet:
 data:
   dataset: celeba
   image_size: 64
-  batch_size: 64
+  batch_size: 128
   seed: 42
   horizontal_flip: true
 
 training:
-  num_steps: 40000
+  num_steps: 20000
   optimizer: adamw
-  learning_rate: 0.0002
+  # 2e-4 exploded. 20k steps at batch 128 ≈ 40k at 64 images-wise;
+  # sqrt batch scale of 1e-4 → 1.4e-4. Warmup is 5% of the 20k horizon.
+  learning_rate: 0.00014
   lr_schedule: cosine
   lr_warmup_steps: 1000
   lr_min_ratio: 0.01
-  ema_decay: 0.9999
+  ema_decay: 0.999
   weight_decay: 0.01
   max_grad_norm: 1.0
   checkpoint_every: 500

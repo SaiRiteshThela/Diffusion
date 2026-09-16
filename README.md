@@ -81,3 +81,24 @@ is downloaded to `/workspace-global/Diffusion-data/datasets/celeba`.
 resolution stages, two residual blocks) and trains with cosine decay, warmup,
 AdamW, and horizontal flips. After training it samples from the best EMA
 checkpoint.
+
+
+### Persistent Experiment 6 training
+
+On RunPod, open `experiments/experiment_6_live.ipynb` with the
+`Python (diffusion)` kernel. Install `tmux` on the pod, then run setup,
+launch/resume, and monitor. Training runs in a detached tmux session named
+`experiment-6`, so disconnecting from RunPod, SSH, or Jupyter does not stop it.
+The pod must remain running.
+
+After reconnecting, run setup and monitor again. Interrupting the monitor only
+pauses its display. Avoid launching training in the original Experiment 6
+notebook at the same time. Logs are saved to
+`.training/experiment-6/training.log`; checkpoints and samples use the existing
+storage paths.
+
+The live launcher sets `DIFFUSION_CHECKPOINT_TMPDIR=/dev/shm/diffusion-ckpts`
+for temporary checkpoint writes before copying to persistent storage. Ensure
+this area has room for a full checkpoint (about 4.4 GiB for Experiment 6).
+Other launchers default to `/tmp/diffusion-ckpts`; set the environment variable
+to another local filesystem with enough free space if necessary.

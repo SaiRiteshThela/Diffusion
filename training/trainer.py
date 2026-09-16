@@ -1,3 +1,7 @@
+import math
+import os
+import shutil
+import tempfile
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from copy import deepcopy
@@ -75,6 +79,7 @@ class Trainer(ABC):
         lr_schedule: str | None = None,
         lr_warmup_steps: int = 0,
         lr_min_ratio: float = 0.01,
+        scheduler_num_steps: int | None = None,
     ) -> torch.optim.lr_scheduler.LRScheduler | None:
         if lr_milestones and lr_schedule == _COSINE_SCHEDULE:
             raise ValueError("use lr_milestones or lr_schedule='cosine', not both")
@@ -82,6 +87,9 @@ class Trainer(ABC):
             raise ValueError("lr_warmup_steps must be non-negative")
         if not 0 <= lr_min_ratio < 1:
             raise ValueError("lr_min_ratio must be in [0, 1)")
+        if scheduler_num_steps is not None and scheduler_num_steps < num_steps:
+            raise ValueError("scheduler_num_steps must be >= num_steps")
+        horizon = num_steps if scheduler_num_steps is None else scheduler_num_steps
         if lr_milestones:
             return torch.optim.lr_scheduler.MultiStepLR(
                 optimizer,
@@ -95,11 +103,11 @@ class Trainer(ABC):
                 f"unknown lr_schedule {lr_schedule!r}, expected one of "
                 f"{sorted(s for s in _NO_SCHEDULE if isinstance(s, str)) + [_COSINE_SCHEDULE]}"
             )
-        if lr_warmup_steps >= num_steps:
-            raise ValueError("lr_warmup_steps must be smaller than num_steps")
+        if lr_warmup_steps >= horizon:
+            raise ValueError("lr_warmup_steps must be smaller than the scheduler horizon")
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=max(num_steps - lr_warmup_steps, 1),
+            T_max=max(horizon - lr_warmup_steps, 1),
             eta_min=lr * lr_min_ratio,
         )
         if lr_warmup_steps == 0:
@@ -128,6 +136,8 @@ class Trainer(ABC):
         lr_schedule: str | None = None,
         lr_warmup_steps: int = 0,
         lr_min_ratio: float = 0.01,
+        scheduler_num_steps: int | None = None,
+        abort_train_loss: float | None = None,
         ema_decay: float | None = None,
         ckpt_path: str | Path | None = None,
         best_ckpt_path: str | Path | None = None,
@@ -153,6 +163,8 @@ class Trainer(ABC):
             raise ValueError("lr_gamma must be positive")
         if ema_decay is not None and not 0 <= ema_decay < 1:
             raise ValueError("ema_decay must be in [0, 1)")
+        if abort_train_loss is not None and abort_train_loss <= 0:
+            raise ValueError("abort_train_loss must be positive")
 
         size_b = model_size_b(self.model)
         print(f"Training model with size: {size_b / MiB:.3f} MiB")
@@ -168,6 +180,7 @@ class Trainer(ABC):
             lr_schedule=lr_schedule,
             lr_warmup_steps=lr_warmup_steps,
             lr_min_ratio=lr_min_ratio,
+            scheduler_num_steps=scheduler_num_steps,
         )
         ema_model = deepcopy(self.model).eval() if ema_decay is not None else None
         if ema_model is not None:
@@ -225,29 +238,40 @@ class Trainer(ABC):
                 return
             output = Path(path)
             output.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "model": self.model.state_dict(),
-                    "ema_model": ema_model.state_dict() if ema_model is not None else None,
-                    "optimizer": opt.state_dict(),
-                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                    "history": history(),
-                    "step": step,
-                    "num_steps": num_steps,
-                    "lr": lr,
-                    "optimizer_name": optimizer_name,
-                    "weight_decay": weight_decay,
-                    "max_grad_norm": max_grad_norm,
-                    "lr_milestones": lr_milestones,
-                    "lr_gamma": lr_gamma,
-                    "lr_schedule": lr_schedule,
-                    "lr_warmup_steps": lr_warmup_steps,
-                    "lr_min_ratio": lr_min_ratio,
-                    "ema_decay": ema_decay,
-                    "train_kwargs": kwargs,
-                },
-                output,
-            )
+            payload = {
+                "model": self.model.state_dict(),
+                "ema_model": ema_model.state_dict() if ema_model is not None else None,
+                "optimizer": opt.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "history": history(),
+                "step": step,
+                "num_steps": num_steps,
+                "lr": lr,
+                "optimizer_name": optimizer_name,
+                "weight_decay": weight_decay,
+                "max_grad_norm": max_grad_norm,
+                "lr_milestones": lr_milestones,
+                "lr_gamma": lr_gamma,
+                "lr_schedule": lr_schedule,
+                "lr_warmup_steps": lr_warmup_steps,
+                "lr_min_ratio": lr_min_ratio,
+                "scheduler_num_steps": scheduler_num_steps,
+                "abort_train_loss": abort_train_loss,
+                "ema_decay": ema_decay,
+                "train_kwargs": kwargs,
+            }
+            # Write locally first: GeeseFS/FUSE often corrupts torch zip files.
+            tmp_dir = Path(os.getenv("DIFFUSION_CHECKPOINT_TMPDIR", "/tmp/diffusion-ckpts"))
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=tmp_dir, prefix=f"{output.name}.", suffix=".partial", delete=False
+            ) as temporary:
+                tmp_path = Path(temporary.name)
+            try:
+                torch.save(payload, tmp_path)
+                shutil.copyfile(tmp_path, output)
+            finally:
+                tmp_path.unlink(missing_ok=True)
 
         if start_step == 0 and val_every > 0:
             with evaluation_model():
@@ -279,6 +303,31 @@ class Trainer(ABC):
                 self.model.train()
                 opt.zero_grad()
                 loss = self.get_train_loss(**kwargs)
+                loss_value = float(loss.item())
+                train_losses.append(loss.detach().cpu())
+                last_step = step
+                if math.isfinite(loss_value):
+                    best_train_loss = min(best_train_loss, loss_value)
+                desc = f"Step {step}, train: {loss_value:.3f}"
+                log_data: dict[str, Any] = {
+                    "loss/train": loss_value,
+                    "loss/train_best": best_train_loss,
+                    "learning_rate": opt.param_groups[0]["lr"],
+                }
+                exploded = not math.isfinite(loss_value) or (
+                    abort_train_loss is not None and loss_value > abort_train_loss
+                )
+                if exploded:
+                    if wandb_run is not None:
+                        wandb_run.log(log_data, step=step)
+                    pbar.set_description(desc)
+                    reason = (
+                        "non-finite"
+                        if not math.isfinite(loss_value)
+                        else f"> {abort_train_loss}"
+                    )
+                    print(f"aborting: train loss {loss_value} {reason} at step {step}")
+                    break
                 loss.backward()
                 if max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
@@ -295,16 +344,7 @@ class Trainer(ABC):
                             ema_buffer.copy_(buffer)
                 if scheduler is not None:
                     scheduler.step()
-                train_losses.append(loss.detach().cpu())
-                best_train_loss = min(best_train_loss, loss.item())
-                last_step = step
-
-                desc = f"Step {step}, train: {loss.item():.3f}"
-                log_data: dict[str, Any] = {
-                    "loss/train": loss.item(),
-                    "loss/train_best": best_train_loss,
-                    "learning_rate": opt.param_groups[0]["lr"],
-                }
+                log_data["learning_rate"] = opt.param_groups[0]["lr"]
                 if val_every > 0 and step % val_every == 0:
                     with evaluation_model():
                         self.model.eval()

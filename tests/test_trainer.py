@@ -151,6 +151,77 @@ def test_cosine_schedule_decays_learning_rate():
     assert logged[-1] < logged[0]
 
 
+def test_abort_train_loss_stops_before_backward():
+    trainer = FlowTrainer(_path(), TinyFlow())
+    values = iter([0.5, 0.25, 99.0, 0.1])
+
+    def fake_loss(batch_size: int):
+        del batch_size
+        return torch.tensor(next(values), requires_grad=True)
+
+    trainer.get_train_loss = fake_loss  # type: ignore[method-assign]
+    hist = trainer.train(
+        num_steps=10,
+        device=torch.device("cpu"),
+        lr=1e-3,
+        batch_size=4,
+        abort_train_loss=10.0,
+        checkpoint_every=0,
+        val_every=0,
+        plot_every=0,
+    )
+    assert hist["train"].shape == (3,)
+    assert hist["train"][-1].item() == pytest.approx(99.0)
+
+
+def test_scheduler_num_steps_keeps_higher_lr():
+    short = []
+    long = []
+
+    class FakeRun:
+        def __init__(self, bucket):
+            self.bucket = bucket
+
+        def log(self, data, step):
+            if "learning_rate" in data:
+                self.bucket.append(data["learning_rate"])
+
+    kwargs = dict(
+        num_steps=4,
+        device=torch.device("cpu"),
+        lr=1e-3,
+        lr_schedule="cosine",
+        lr_warmup_steps=0,
+        batch_size=4,
+        checkpoint_every=0,
+        val_every=0,
+        plot_every=0,
+    )
+    FlowTrainer(_path(), TinyFlow()).train(**kwargs, wandb_run=FakeRun(short))
+    FlowTrainer(_path(), TinyFlow()).train(
+        **kwargs,
+        scheduler_num_steps=100,
+        wandb_run=FakeRun(long),
+    )
+    assert long[-1] > short[-1]
+
+
+def test_scheduler_num_steps_must_cover_training():
+    trainer = FlowTrainer(_path(), TinyFlow())
+    with pytest.raises(ValueError, match="scheduler_num_steps"):
+        trainer.train(
+            num_steps=4,
+            device=torch.device("cpu"),
+            lr=1e-3,
+            lr_schedule="cosine",
+            scheduler_num_steps=2,
+            batch_size=4,
+            checkpoint_every=0,
+            val_every=0,
+            plot_every=0,
+        )
+
+
 def test_cosine_rejects_milestones():
     trainer = FlowTrainer(_path(), TinyFlow())
     with pytest.raises(ValueError, match="not both"):
@@ -165,3 +236,40 @@ def test_cosine_rejects_milestones():
             val_every=0,
             plot_every=0,
         )
+
+
+def test_checkpoint_uses_configured_staging_directory(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    monkeypatch.setenv("DIFFUSION_CHECKPOINT_TMPDIR", str(staging))
+    checkpoint = tmp_path / "saved.pt"
+    trainer = FlowTrainer(_path(), TinyFlow())
+    trainer.train(
+        num_steps=1, device=torch.device("cpu"), batch_size=4,
+        ckpt_path=checkpoint, checkpoint_every=0, val_every=0, plot_every=0,
+    )
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert saved["step"] == 1
+    assert staging.exists()
+    assert list(staging.iterdir()) == []
+
+
+def test_failed_checkpoint_save_cleans_staging_and_preserves_previous(tmp_path, monkeypatch):
+    staging = tmp_path / "staging"
+    monkeypatch.setenv("DIFFUSION_CHECKPOINT_TMPDIR", str(staging))
+    checkpoint = tmp_path / "saved.pt"
+    checkpoint.write_bytes(b"previous checkpoint")
+
+    def failing_save(payload, path):
+        assert Path(path).parent == staging
+        Path(path).write_bytes(b"partial checkpoint")
+        raise RuntimeError("simulated disk full")
+
+    monkeypatch.setattr(torch, "save", failing_save)
+    trainer = FlowTrainer(_path(), TinyFlow())
+    with pytest.raises(RuntimeError, match="simulated disk full"):
+        trainer.train(
+            num_steps=1, device=torch.device("cpu"), batch_size=4,
+            ckpt_path=checkpoint, checkpoint_every=0, val_every=0, plot_every=0,
+        )
+    assert checkpoint.read_bytes() == b"previous checkpoint"
+    assert list(staging.iterdir()) == []
