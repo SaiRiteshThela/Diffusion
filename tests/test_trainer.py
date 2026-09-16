@@ -50,6 +50,7 @@ def test_flow_trainer_train_and_checkpoint(tmp_path: Path):
     val_path = _path()
     model = TinyFlow()
     ckpt = tmp_path / "flow.pt"
+    best_ckpt = tmp_path / "flow_best.pt"
     samples = tmp_path / "samples"
     logged = []
 
@@ -62,8 +63,12 @@ def test_flow_trainer_train_and_checkpoint(tmp_path: Path):
         num_steps=2,
         device=torch.device("cpu"),
         lr=1e-3,
+        lr_milestones=[1],
+        lr_gamma=0.5,
+        ema_decay=0.9,
         batch_size=4,
         ckpt_path=ckpt,
+        best_ckpt_path=best_ckpt,
         checkpoint_every=1,
         val_every=1,
         val_batches=2,
@@ -83,12 +88,17 @@ def test_flow_trainer_train_and_checkpoint(tmp_path: Path):
     assert "loss/train" in logged[-1][0]
     assert "loss/val" in logged[-1][0]
     assert "samples/trajectory" in logged[-1][0]
+    assert logged[1][0]["learning_rate"] == pytest.approx(5e-4)
     saved = torch.load(ckpt, map_location="cpu", weights_only=False)
+    best_saved = torch.load(best_ckpt, map_location="cpu", weights_only=False)
     assert "model" in saved
+    assert saved["ema_model"] is not None
     assert "optimizer" in saved
+    assert saved["scheduler"] is not None
     assert saved["num_steps"] == 2
     assert saved["step"] == 2
     assert saved["train_kwargs"]["batch_size"] == 4
+    assert best_saved["step"] in {0, 1, 2}
     model.load_state_dict(saved["model"])
 
     resumed = FlowTrainer(path, TinyFlow(), val_path=val_path)

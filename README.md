@@ -67,3 +67,8 @@ and applies the training profile from
 [`Michedev/flow-matching-mnist`](https://github.com/Michedev/flow-matching-mnist):
 Adam, learning rate `1e-4`, batch size 32, and ten epoch-equivalents. Its target
 is to improve on the verified Experiment 2 validation loss of `0.124551`.
+
+`experiments/experiment_4.ipynb` keeps that architecture and training length,
+but drops the learning rate at steps 10,000 and 14,000. It maintains EMA
+weights for validation and sampling, and saves a separate best-validation
+checkpoint. Its target is Experiment 3's best validation loss of `0.123984`.

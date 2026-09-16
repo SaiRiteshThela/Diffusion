@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +71,11 @@ class Trainer(ABC):
         optimizer_name: str = "adam",
         weight_decay: float = 0.0,
         max_grad_norm: float | None = None,
+        lr_milestones: list[int] | None = None,
+        lr_gamma: float = 0.1,
+        ema_decay: float | None = None,
         ckpt_path: str | Path | None = None,
+        best_ckpt_path: str | Path | None = None,
         checkpoint_every: int = 50,
         val_every: int = 50,
         val_batches: int = 8,
@@ -86,12 +92,30 @@ class Trainer(ABC):
             raise ValueError("num_steps must be positive")
         if val_every > 0 and val_batches < 1:
             raise ValueError("val_batches must be positive when validation is enabled")
+        if lr_milestones and any(step < 1 for step in lr_milestones):
+            raise ValueError("lr milestones must be positive")
+        if lr_gamma <= 0:
+            raise ValueError("lr_gamma must be positive")
+        if ema_decay is not None and not 0 <= ema_decay < 1:
+            raise ValueError("ema_decay must be in [0, 1)")
 
         size_b = model_size_b(self.model)
         print(f"Training model with size: {size_b / MiB:.3f} MiB")
 
         self.model.to(device)
         opt = self.get_optimizer(lr, optimizer_name, weight_decay)
+        scheduler = (
+            torch.optim.lr_scheduler.MultiStepLR(
+                opt,
+                milestones=sorted(lr_milestones),
+                gamma=lr_gamma,
+            )
+            if lr_milestones
+            else None
+        )
+        ema_model = deepcopy(self.model).eval() if ema_decay is not None else None
+        if ema_model is not None:
+            ema_model.requires_grad_(False)
         start_step = 0
         train_losses: list[Tensor] = []
         val_losses: list[Tensor] = []
@@ -101,9 +125,17 @@ class Trainer(ABC):
             state = torch.load(resume_from, map_location=device, weights_only=False)
             self.model.load_state_dict(state["model"])
             opt.load_state_dict(state["optimizer"])
+            if scheduler is not None and state.get("scheduler") is not None:
+                scheduler.load_state_dict(state["scheduler"])
+            if ema_model is not None and state.get("ema_model") is not None:
+                ema_model.load_state_dict(state["ema_model"])
             start_step = int(state["step"])
-            train_losses = list(state["history"]["train"])
-            val_losses = list(state["history"].get("val", []))
+            train_losses = [
+                value.detach().cpu() for value in state["history"]["train"]
+            ]
+            val_losses = [
+                value.detach().cpu() for value in state["history"].get("val", [])
+            ]
             val_steps = [int(step) for step in state["history"].get("val_steps", [])]
             if start_step > num_steps:
                 raise ValueError(
@@ -122,15 +154,27 @@ class Trainer(ABC):
                 result["val_steps"] = torch.tensor(val_steps, dtype=torch.long)
             return result
 
-        def save_checkpoint(step: int) -> None:
-            if ckpt_path is None:
+        @contextmanager
+        def evaluation_model():
+            training_model = self.model
+            if ema_model is not None:
+                self.model = ema_model
+            try:
+                yield
+            finally:
+                self.model = training_model
+
+        def save_checkpoint(step: int, path: str | Path | None = ckpt_path) -> None:
+            if path is None:
                 return
-            output = Path(ckpt_path)
+            output = Path(path)
             output.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
                     "model": self.model.state_dict(),
+                    "ema_model": ema_model.state_dict() if ema_model is not None else None,
                     "optimizer": opt.state_dict(),
+                    "scheduler": scheduler.state_dict() if scheduler is not None else None,
                     "history": history(),
                     "step": step,
                     "num_steps": num_steps,
@@ -138,23 +182,28 @@ class Trainer(ABC):
                     "optimizer_name": optimizer_name,
                     "weight_decay": weight_decay,
                     "max_grad_norm": max_grad_norm,
+                    "lr_milestones": lr_milestones,
+                    "lr_gamma": lr_gamma,
+                    "ema_decay": ema_decay,
                     "train_kwargs": kwargs,
                 },
                 output,
             )
 
         if start_step == 0 and val_every > 0:
-            self.model.eval()
-            initial_values = [
-                self.get_val_loss(**kwargs)
-                for _ in range(val_batches)
-            ]
+            with evaluation_model():
+                self.model.eval()
+                initial_values = [
+                    self.get_val_loss(**kwargs)
+                    for _ in range(val_batches)
+                ]
             initial_values = [value for value in initial_values if value is not None]
             if initial_values:
                 initial_val = torch.stack(initial_values).mean()
                 val_losses.append(initial_val.detach().cpu())
                 val_steps.append(0)
                 best_val_loss = initial_val.item()
+                save_checkpoint(0, best_ckpt_path)
                 if wandb_run is not None:
                     wandb_run.log(
                         {
@@ -175,6 +224,18 @@ class Trainer(ABC):
                 if max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
                 opt.step()
+                if ema_model is not None:
+                    with torch.no_grad():
+                        for ema_param, param in zip(
+                            ema_model.parameters(), self.model.parameters()
+                        ):
+                            ema_param.lerp_(param, 1 - ema_decay)
+                        for ema_buffer, buffer in zip(
+                            ema_model.buffers(), self.model.buffers()
+                        ):
+                            ema_buffer.copy_(buffer)
+                if scheduler is not None:
+                    scheduler.step()
                 train_losses.append(loss.detach().cpu())
                 best_train_loss = min(best_train_loss, loss.item())
                 last_step = step
@@ -183,32 +244,38 @@ class Trainer(ABC):
                 log_data: dict[str, Any] = {
                     "loss/train": loss.item(),
                     "loss/train_best": best_train_loss,
+                    "learning_rate": opt.param_groups[0]["lr"],
                 }
                 if val_every > 0 and step % val_every == 0:
-                    self.model.eval()
-                    values = [
-                        self.get_val_loss(**kwargs)
-                        for _ in range(val_batches)
-                    ]
+                    with evaluation_model():
+                        self.model.eval()
+                        values = [
+                            self.get_val_loss(**kwargs)
+                            for _ in range(val_batches)
+                        ]
                     values = [value for value in values if value is not None]
                     if values:
                         val = torch.stack(values).mean()
                         val_losses.append(val.detach().cpu())
                         val_steps.append(step)
+                        is_best = val.item() < best_val_loss
                         best_val_loss = min(best_val_loss, val.item())
+                        if is_best:
+                            save_checkpoint(step, best_ckpt_path)
                         desc += f", val: {val.item():.3f}"
                         log_data["loss/val"] = val.item()
                         log_data["loss/val_best"] = best_val_loss
 
                 if plot_every > 0 and step % plot_every == 0:
-                    self.model.eval()
-                    trajectory_path = self.plot_trajectory(
-                        step=step,
-                        n_images=n_plot_images,
-                        n_steps=n_plot_steps,
-                        samples_dir=samples_dir,
-                        show=show_plots,
-                    )
+                    with evaluation_model():
+                        self.model.eval()
+                        trajectory_path = self.plot_trajectory(
+                            step=step,
+                            n_images=n_plot_images,
+                            n_steps=n_plot_steps,
+                            samples_dir=samples_dir,
+                            show=show_plots,
+                        )
                     if wandb_run is not None and trajectory_path is not None:
                         log_data["samples/trajectory"] = wandb.Image(
                             str(trajectory_path),
