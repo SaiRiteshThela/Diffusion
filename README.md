@@ -61,3 +61,9 @@ Generate 25 samples from the Experiment 2 winner with 1,000 Euler steps:
 ```bash
 uv run python -m sampling.generate_experiment_2
 ```
+
+`experiments/experiment_3.ipynb` keeps the Experiment 2 winning architecture
+and applies the training profile from
+[`Michedev/flow-matching-mnist`](https://github.com/Michedev/flow-matching-mnist):
+Adam, learning rate `1e-4`, batch size 32, and ten epoch-equivalents. Its target
+is to improve on the verified Experiment 2 validation loss of `0.124551`.
