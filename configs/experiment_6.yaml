@@ -1,0 +1,50 @@
+# Experiment 6: larger U-Net on CelebA-64.
+# Exp 5 (~30M, 20k steps, MultiStepLR) peaked at step 12k then got worse after
+# the LR drops. This run scales the same architecture (not a rewrite to ADM):
+# extra coarsest scale to 4x4, two residual blocks, cosine decay with warmup.
+
+time_embedding:
+  time_emb_dim: 128
+  scaled_time_emb_dim: 256
+
+unet:
+  in_channels: 3
+  start_dim: 128
+  dim_mults: [1, 2, 4, 8]
+  residual_blocks_per_group: 2
+  group_norm_num_groups: 8
+  time_emb_dim: 256
+  n_heads: 8
+  d_ff: 1024
+  attn_dropout: 0.1
+  ffn_dropout: 0.1
+  proj_dropout: 0.0
+  activation: gelu
+
+data:
+  dataset: celeba
+  image_size: 64
+  batch_size: 64
+  seed: 42
+  horizontal_flip: true
+
+training:
+  num_steps: 40000
+  optimizer: adamw
+  learning_rate: 0.0002
+  lr_schedule: cosine
+  lr_warmup_steps: 1000
+  lr_min_ratio: 0.01
+  ema_decay: 0.9999
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  checkpoint_every: 500
+  val_every: 200
+  val_batches: 8
+  plot_every: 1000
+
+sampling:
+  num_samples: 25
+  ode_steps: 100
+  n_plot_images: 8
+  n_plot_steps: 12

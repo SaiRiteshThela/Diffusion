@@ -17,6 +17,8 @@ from sampling.ode import EulerSimulator, FlowODE
 from training.path import GaussianConditionalProbabilityPath
 
 MiB = 1024**2
+_COSINE_SCHEDULE = "cosine"
+_NO_SCHEDULE = {None, "", "none", "constant"}
 
 
 def model_size_b(model: nn.Module) -> int:
@@ -63,6 +65,56 @@ class Trainer(ABC):
             weight_decay=weight_decay,
         )
 
+    def get_scheduler(
+        self,
+        optimizer: torch.optim.Optimizer,
+        num_steps: int,
+        lr: float,
+        lr_milestones: list[int] | None = None,
+        lr_gamma: float = 0.1,
+        lr_schedule: str | None = None,
+        lr_warmup_steps: int = 0,
+        lr_min_ratio: float = 0.01,
+    ) -> torch.optim.lr_scheduler.LRScheduler | None:
+        if lr_milestones and lr_schedule == _COSINE_SCHEDULE:
+            raise ValueError("use lr_milestones or lr_schedule='cosine', not both")
+        if lr_warmup_steps < 0:
+            raise ValueError("lr_warmup_steps must be non-negative")
+        if not 0 <= lr_min_ratio < 1:
+            raise ValueError("lr_min_ratio must be in [0, 1)")
+        if lr_milestones:
+            return torch.optim.lr_scheduler.MultiStepLR(
+                optimizer,
+                milestones=sorted(lr_milestones),
+                gamma=lr_gamma,
+            )
+        if lr_schedule in _NO_SCHEDULE:
+            return None
+        if lr_schedule != _COSINE_SCHEDULE:
+            raise ValueError(
+                f"unknown lr_schedule {lr_schedule!r}, expected one of "
+                f"{sorted(s for s in _NO_SCHEDULE if isinstance(s, str)) + [_COSINE_SCHEDULE]}"
+            )
+        if lr_warmup_steps >= num_steps:
+            raise ValueError("lr_warmup_steps must be smaller than num_steps")
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(num_steps - lr_warmup_steps, 1),
+            eta_min=lr * lr_min_ratio,
+        )
+        if lr_warmup_steps == 0:
+            return cosine
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.01,
+            total_iters=lr_warmup_steps,
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[lr_warmup_steps],
+        )
+
     def train(
         self,
         num_steps: int,
@@ -73,6 +125,9 @@ class Trainer(ABC):
         max_grad_norm: float | None = None,
         lr_milestones: list[int] | None = None,
         lr_gamma: float = 0.1,
+        lr_schedule: str | None = None,
+        lr_warmup_steps: int = 0,
+        lr_min_ratio: float = 0.01,
         ema_decay: float | None = None,
         ckpt_path: str | Path | None = None,
         best_ckpt_path: str | Path | None = None,
@@ -104,14 +159,15 @@ class Trainer(ABC):
 
         self.model.to(device)
         opt = self.get_optimizer(lr, optimizer_name, weight_decay)
-        scheduler = (
-            torch.optim.lr_scheduler.MultiStepLR(
-                opt,
-                milestones=sorted(lr_milestones),
-                gamma=lr_gamma,
-            )
-            if lr_milestones
-            else None
+        scheduler = self.get_scheduler(
+            opt,
+            num_steps=num_steps,
+            lr=lr,
+            lr_milestones=lr_milestones,
+            lr_gamma=lr_gamma,
+            lr_schedule=lr_schedule,
+            lr_warmup_steps=lr_warmup_steps,
+            lr_min_ratio=lr_min_ratio,
         )
         ema_model = deepcopy(self.model).eval() if ema_decay is not None else None
         if ema_model is not None:
@@ -184,6 +240,9 @@ class Trainer(ABC):
                     "max_grad_norm": max_grad_norm,
                     "lr_milestones": lr_milestones,
                     "lr_gamma": lr_gamma,
+                    "lr_schedule": lr_schedule,
+                    "lr_warmup_steps": lr_warmup_steps,
+                    "lr_min_ratio": lr_min_ratio,
                     "ema_decay": ema_decay,
                     "train_kwargs": kwargs,
                 },
@@ -351,7 +410,11 @@ class FlowTrainer(Trainer):
         frames = traj.reshape(n_images * n_steps, *traj.shape[2:])
         grid = make_grid(frames, nrow=n_steps, normalize=True, value_range=(-1, 1))
         fig, ax = plt.subplots(figsize=(n_steps, n_images))
-        ax.imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap="gray")
+        image = grid.permute(1, 2, 0).cpu().numpy()
+        if image.shape[-1] == 1:
+            ax.imshow(image.squeeze(-1), cmap="gray")
+        else:
+            ax.imshow(image.clip(0, 1))
         ax.axis("off")
         ax.set_title(f"step {step}: {n_images} trajectories (t=0 → 1)")
         fig.tight_layout()

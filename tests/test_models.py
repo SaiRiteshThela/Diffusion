@@ -19,6 +19,7 @@ from models.upsample import Upsample
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "configs" / "dummy.yaml"
 MNIST_CONFIG = ROOT / "configs" / "mnist.yaml"
+EXPERIMENT_6_CONFIG = ROOT / "configs" / "experiment_6.yaml"
 
 
 def _config():
@@ -112,6 +113,15 @@ def test_flow_model_batch_mismatch():
     xt = torch.randn(2, 3, 32, 32)
     with pytest.raises(ValueError, match="batch"):
         model(xt, torch.rand(3))
+
+
+def test_flow_model_experiment_6_config():
+    cfg = load_config(EXPERIMENT_6_CONFIG)
+    model = FlowModel.from_config(EXPERIMENT_6_CONFIG)
+    xt = torch.randn(2, cfg["unet"]["in_channels"], 16, 16)
+    u = model(xt, torch.rand(2))
+    assert u.shape == xt.shape
+    assert sum(param.numel() for param in model.parameters()) > 30_000_000
 
 
 def test_flow_model_mnist_config():

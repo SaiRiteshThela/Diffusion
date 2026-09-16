@@ -1,0 +1,47 @@
+# Experiment 5: the Experiment 2 winning architecture on CelebA.
+# Only the data/interface changes: 3-channel 64x64 faces, official splits,
+# and the Experiment 4 stepped-LR + EMA training recipe.
+
+time_embedding:
+  time_emb_dim: 128
+  scaled_time_emb_dim: 256
+
+unet:
+  in_channels: 3
+  start_dim: 96
+  dim_mults: [1, 2, 4]
+  residual_blocks_per_group: 1
+  group_norm_num_groups: 8
+  time_emb_dim: 256
+  n_heads: 2
+  d_ff: 512
+  attn_dropout: 0.2
+  ffn_dropout: 0.1
+  proj_dropout: 0.0
+  activation: gelu
+
+data:
+  dataset: celeba
+  image_size: 64
+  batch_size: 32
+  seed: 42
+
+training:
+  num_steps: 20000
+  optimizer: adam
+  learning_rate: 0.0001
+  lr_milestones: [12000, 16000]
+  lr_gamma: 0.3
+  ema_decay: 0.999
+  weight_decay: 0.0
+  max_grad_norm: null
+  checkpoint_every: 500
+  val_every: 200
+  val_batches: 8
+  plot_every: 1000
+
+sampling:
+  num_samples: 25
+  ode_steps: 400
+  n_plot_images: 8
+  n_plot_steps: 12

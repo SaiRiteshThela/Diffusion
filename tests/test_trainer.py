@@ -124,3 +124,44 @@ def test_flow_trainer_val_loss():
     assert val is not None
     assert torch.isfinite(val)
     assert FlowTrainer(_path(), TinyFlow()).get_val_loss(batch_size=4) is None
+
+
+def test_cosine_schedule_decays_learning_rate():
+    logged = []
+
+    class FakeRun:
+        def log(self, data, step):
+            if "learning_rate" in data:
+                logged.append(data["learning_rate"])
+
+    trainer = FlowTrainer(_path(), TinyFlow())
+    trainer.train(
+        num_steps=6,
+        device=torch.device("cpu"),
+        lr=1e-3,
+        lr_schedule="cosine",
+        lr_warmup_steps=0,
+        batch_size=4,
+        checkpoint_every=0,
+        val_every=0,
+        plot_every=0,
+        wandb_run=FakeRun(),
+    )
+    assert logged
+    assert logged[-1] < logged[0]
+
+
+def test_cosine_rejects_milestones():
+    trainer = FlowTrainer(_path(), TinyFlow())
+    with pytest.raises(ValueError, match="not both"):
+        trainer.train(
+            num_steps=2,
+            device=torch.device("cpu"),
+            lr=1e-3,
+            lr_milestones=[1],
+            lr_schedule="cosine",
+            batch_size=4,
+            checkpoint_every=0,
+            val_every=0,
+            plot_every=0,
+        )

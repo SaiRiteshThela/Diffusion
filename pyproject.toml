@@ -13,6 +13,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "tqdm>=4.70.1",
     "wandb>=0.30.0",
+    "pytorch-fid>=0.3.0",
 ]
 
 [dependency-groups]

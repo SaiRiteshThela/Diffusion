@@ -72,3 +72,12 @@ is to improve on the verified Experiment 2 validation loss of `0.124551`.
 but drops the learning rate at steps 10,000 and 14,000. It maintains EMA
 weights for validation and sampling, and saves a separate best-validation
 checkpoint. Its target is Experiment 3's best validation loss of `0.123984`.
+
+`experiments/experiment_5.ipynb` keeps the same U-Net, stepped learning rate,
+and EMA recipe, but trains on 64x64 CelebA faces (`in_channels=3`). The dataset
+is downloaded to `/workspace-global/Diffusion-data/datasets/celeba`.
+
+`experiments/experiment_6.ipynb` scales that U-Net (`start_dim` 128, four
+resolution stages, two residual blocks) and trains with cosine decay, warmup,
+AdamW, and horizontal flips. After training it samples from the best EMA
+checkpoint.
