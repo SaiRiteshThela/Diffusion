@@ -4,13 +4,14 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from models.adm_unet import ADMUNet
 from models.config import load_config
 from models.time_embedding import SinusoidalTimeEmbeddings
 from models.unet import UNet
 
 
 class FlowModel(nn.Module):
-    def __init__(self, unet: UNet, time_embed: SinusoidalTimeEmbeddings):
+    def __init__(self, unet: nn.Module, time_embed: nn.Module):
         super().__init__()
         self.unet = unet
         self.time_embed = time_embed
@@ -18,6 +19,13 @@ class FlowModel(nn.Module):
     @classmethod
     def from_config(cls, path: str | Path) -> "FlowModel":
         cfg = load_config(path)
+        model_type = cfg.get("model_type", "custom")
+        if model_type == "adm":
+            # ADM embeds normalized times internally; legacy configs retain
+            # their existing wrapper and checkpoint keys.
+            return cls(ADMUNet(**cfg.get("adm_unet", {})), nn.Identity())
+        if model_type != "custom":
+            raise ValueError(f"unknown model_type {model_type!r}; expected 'custom' or 'adm'")
         time_embed = SinusoidalTimeEmbeddings(**cfg["time_embedding"])
         unet = UNet.from_config(path)
         return cls(unet, time_embed)
