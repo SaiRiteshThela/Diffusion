@@ -227,6 +227,7 @@ class Trainer(ABC):
         n_sampling_steps: int | None = None,
         deadline_timestamp: float | None = None,
         handle_signals: bool = False,
+        scheduler_restart_id: str | None = None,
         **kwargs,
     ) -> dict[str, Tensor]:
         """Train with optional reproducible evaluation and a wall-clock deadline.
@@ -234,6 +235,9 @@ class Trainer(ABC):
         ``step`` and history count completed optimizer/EMA/scheduler updates.
         A deadline or deferred SIGINT/SIGTERM ends between updates, then saves.
         BF16 applies to forward passes; FlowTrainer still reduces its MSE in FP32.
+        A new scheduler_restart_id explicitly starts a fresh schedule over the
+        remaining updates while preserving model, optimizer moments, EMA and RNG.
+        Resuming the same identifier continues that schedule without restarting.
         """
         device = torch.device(device)
         if num_steps < 1:
@@ -258,6 +262,10 @@ class Trainer(ABC):
             raise ValueError("deadline_timestamp must be finite")
         if n_sampling_steps is not None and n_sampling_steps < 1:
             raise ValueError("n_sampling_steps must be positive")
+        if scheduler_restart_id is not None and (
+            not isinstance(scheduler_restart_id, str) or not scheduler_restart_id.strip()
+        ):
+            raise ValueError("scheduler_restart_id must be a nonempty string or None")
 
         size_b = model_size_b(self.model)
         print(f"Training model with size: {size_b / MiB:.3f} MiB")
@@ -283,6 +291,8 @@ class Trainer(ABC):
         if ema_model is not None:
             ema_model.requires_grad_(False)
         start_step = 0
+        scheduler_restart_start_step = 0 if scheduler_restart_id is not None else None
+        scheduler_restart_end_step = num_steps if scheduler_restart_id is not None else None
         train_losses: list[Tensor] = []
         val_losses: list[Tensor] = []
         val_steps: list[int] = []
@@ -294,8 +304,32 @@ class Trainer(ABC):
             state = torch.load(resolve_checkpoint_path(resume_from), map_location="cpu", weights_only=False)
             self.model.load_state_dict(state["model"])
             opt.load_state_dict(state["optimizer"])
-            if scheduler is not None and state.get("scheduler") is not None:
-                scheduler.load_state_dict(state["scheduler"])
+            saved_restart_id = state.get("scheduler_restart_id")
+            if scheduler_restart_id is not None and scheduler_restart_id != saved_restart_id:
+                scheduler_restart_start_step = int(state["step"])
+                scheduler_restart_end_step = num_steps
+                remaining_updates = num_steps - scheduler_restart_start_step
+                if remaining_updates < 1:
+                    raise ValueError("scheduler restart requires remaining optimizer updates")
+                for group in opt.param_groups:
+                    group["lr"] = lr
+                    group["initial_lr"] = lr
+                scheduler = self.get_scheduler(
+                    opt, num_steps=remaining_updates, lr=lr,
+                    lr_milestones=lr_milestones, lr_gamma=lr_gamma,
+                    lr_schedule=lr_schedule, lr_warmup_steps=lr_warmup_steps,
+                    lr_min_ratio=lr_min_ratio, scheduler_num_steps=None,
+                )
+                print(f"restarted LR schedule {scheduler_restart_id!r} over {remaining_updates} remaining updates")
+            else:
+                scheduler_restart_start_step = state.get("scheduler_restart_start_step")
+                scheduler_restart_end_step = state.get("scheduler_restart_end_step")
+                if saved_restart_id is not None and scheduler_restart_end_step is not None and num_steps > scheduler_restart_end_step:
+                    raise ValueError("extending a restarted schedule requires a new scheduler_restart_id")
+                if scheduler is not None and state.get("scheduler") is not None:
+                    scheduler.load_state_dict(state["scheduler"])
+                if scheduler_restart_id is None:
+                    scheduler_restart_id = saved_restart_id
             if ema_model is not None:
                 ema_model.load_state_dict(state.get("ema_model") or state["model"])
             start_step = int(state["step"])
@@ -371,6 +405,9 @@ class Trainer(ABC):
                 "lr_warmup_steps": lr_warmup_steps,
                 "lr_min_ratio": lr_min_ratio,
                 "scheduler_num_steps": scheduler_num_steps,
+                "scheduler_restart_id": scheduler_restart_id,
+                "scheduler_restart_start_step": scheduler_restart_start_step,
+                "scheduler_restart_end_step": scheduler_restart_end_step,
                 "abort_train_loss": abort_train_loss,
                 "ema_decay": ema_decay,
                 "ema_warmup": ema_warmup,

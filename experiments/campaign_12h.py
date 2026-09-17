@@ -29,6 +29,72 @@ DEFAULT_DIR = ROOT / "outputs" / CAMPAIGN
 DEFAULT_DEADLINE = datetime(2026, 9, 17, 15, 15, 44, tzinfo=timezone.utc).timestamp()
 REAL_STATS = ROOT / "samples/experiment_5/fid/celeba_train_64_stats.npz"
 LEGACY_REPORT = ROOT / "samples/experiment_5/fid/fid.json"
+CANDIDATE_NAMES = ("adm64", "adm96", "adm64_lr2e4", "adm96_lr2e4", "adm64_lr3e4", "adm96_lr3e4")
+SCREEN_SECONDS = 25 * 60
+PROMOTION_SECONDS = 45 * 60
+FINAL_RESERVE_SECONDS = 60 * 60
+PROMOTION_SEEDS = (42, 31415)
+UNHEALTHY_STOPS = {"loss_limit", "nonfinite_loss", "nonfinite_gradient"}
+
+
+def candidate_width(name: str) -> str:
+    width = name.split("_", 1)[0]
+    if width not in {"adm64", "adm96"}:
+        raise ValueError(f"unknown campaign candidate: {name}")
+    return width
+
+
+def is_screening_result(result: dict, seed: int = 42) -> bool:
+    return (
+        result.get("num_generated") == 2048
+        and result.get("ode_steps") == 32
+        and result.get("seed", 42) == seed
+        and isinstance(result.get("fid"), (int, float))
+        and math.isfinite(result["fid"])
+    )
+
+
+def best_screen_per_width(status: dict) -> list[str]:
+    """Promote one learning rate per width using only the shared seed-42 protocol."""
+    promoted = []
+    for width in ("adm64", "adm96"):
+        eligible = []
+        for name, candidate in status["candidates"].items():
+            if candidate_width(name) != width or not candidate.get("screen_complete") or candidate.get("failed"):
+                continue
+            result = next((value for value in status["evaluations"]
+                           if value["name"] == name + "-screen" and is_screening_result(value)), None)
+            if result is not None:
+                eligible.append((result["fid"], name))
+        if eligible:
+            promoted.append(min(eligible)[1])
+    return promoted
+
+
+def rank_promotions(status: dict) -> tuple[list[tuple[float, str]], list[int]]:
+    """Compare promotion checkpoints over exactly the same available seeds."""
+    by_candidate = {}
+    for name in status.get("promoted", []):
+        candidate = status["candidates"][name]
+        if not candidate.get("promotion_complete") or candidate.get("failed"):
+            continue
+        scores = {}
+        for seed in PROMOTION_SEEDS:
+            suffix = "-promotion" if seed == 42 else f"-promotion-seed{seed}"
+            result = next((value for value in status["evaluations"]
+                           if value["name"] == name + suffix and is_screening_result(value, seed)), None)
+            if result is not None:
+                scores[seed] = result["fid"]
+        if scores:
+            by_candidate[name] = scores
+    if not by_candidate:
+        return [], []
+    common = sorted(set.intersection(*(set(scores) for scores in by_candidate.values())))
+    if not common:
+        return [], []
+    return sorted((sum(scores[seed] for seed in common) / len(common), name)
+                  for name, scores in by_candidate.items()), common
+
 
 
 def utc(timestamp: float | None = None) -> str:
@@ -155,7 +221,7 @@ def train_worker(args):
         run = wandb.init(
             project="celeba-flow-matching", group=CAMPAIGN, id=run_id,
             name=f"{CAMPAIGN}-{run_dir.name}", resume="allow",
-            dir="/workspace/wandb", config=cfg,
+            dir="/workspace/wandb", config=cfg, allow_val_change=True,
             tags=["a40-12h", "unconditional", "same-fm-loss", "adm", "bf16"],
             settings=wandb.Settings(init_timeout=60),
         )
@@ -167,6 +233,8 @@ def train_worker(args):
     write_json(run_dir / "run.json", info)
     tr = cfg["training"]
     sp = cfg["sampling"]
+    phase_started = time.time()
+    phase_start_steps = int(saved_info.get("completed_steps", 0))
     try:
         history = trainer.train(
             num_steps=tr["num_steps"], device=device, lr=tr["learning_rate"],
@@ -182,11 +250,14 @@ def train_worker(args):
             samples_dir=run_dir / "previews", show_plots=False, wandb_run=run,
             resume_from=resolve_checkpoint_path(latest) if resolve_checkpoint_path(latest).exists() else None,
             deadline_timestamp=args.until, handle_signals=True, abort_train_loss=10.0,
+            scheduler_restart_id=tr.get("scheduler_restart_id"),
         )
         info.update({"finished_at": utc(), "completed_steps": trainer.completed_steps, "stop_reason": trainer.last_stop_reason,
-                     "best_fixed_val": float(history["val"].min()) if len(history.get("val", [])) else None})
+                     "best_fixed_val": float(history["val"].min()) if len(history.get("val", [])) else None,
+                     "phase_started_unix": phase_started, "phase_elapsed_seconds": time.time() - phase_started,
+                     "phase_start_steps": phase_start_steps, "phase_completed_steps": trainer.completed_steps - phase_start_steps})
         write_json(run_dir / "run.json", info)
-        if trainer.last_stop_reason in {"loss_limit", "nonfinite_loss", "nonfinite_gradient"}:
+        if trainer.last_stop_reason in UNHEALTHY_STOPS:
             raise RuntimeError(f"Unhealthy training stop: {trainer.last_stop_reason}")
     finally:
         if run is not None:
@@ -200,7 +271,7 @@ def eval_worker(args):
         args.config, args.checkpoint, args.run_dir,
         num_samples=args.samples, ode_steps=args.ode_steps, batch_size=128,
         real_stats_path=REAL_STATS, legacy_real_stats_report=LEGACY_REPORT,
-        deadline_unix=args.until, seed=42,
+        deadline_unix=args.until, seed=args.seed,
     )
     write_json(args.result, result)
 
@@ -284,9 +355,10 @@ def report(status: dict):
         bench = candidate.get("benchmark", {})
         info = read_json(Path(candidate["run_dir"]) / "run.json", {})
         lines.append(f"| {name} | {bench.get('parameters', '')} | {bench.get('seconds_per_step', '')} | {info.get('wandb_url', '')} |")
-    lines.extend(["", "## Evaluations", "", "| Candidate/checkpoint | Samples | Euler updates | FID |", "|---|---:|---:|---:|"])
+    lines.extend(["", "Six 25-minute pilots: widths 64/96 × learning rates 1e-4/2e-4/3e-4. The best learning rate per width receives 45 more minutes; the winner uses the remaining training budget.",
+                  "", "## Evaluations", "", "| Candidate/checkpoint | Samples | Euler updates | Seed | FID |", "|---|---:|---:|---:|---:|"])
     for result in status.get("evaluations", []):
-        lines.append(f"| {result['name']} / step {result.get('checkpoint_step', '?')} | {result.get('num_generated', '?')} | {result.get('ode_steps', '?')} | {result.get('fid', '?')} |")
+        lines.append(f"| {result['name']} / step {result.get('checkpoint_step', '?')} | {result.get('num_generated', '?')} | {result.get('ode_steps', '?')} | {result.get('seed', 42)} | {result.get('fid', '?')} |")
     lines.extend(["", "Screening FID uses 2,048 samples and 32 Euler updates; compare only within that protocol.",
                   "Final evaluations use 10,000 samples and 100 Euler updates.",
                   "Real Inception statistics are reused from the prior, unchanged CelebA preprocessing with recorded provenance."])
@@ -313,7 +385,12 @@ def controller(args):
         "phase": "preparing", "candidates": {}, "evaluations": [], "errors": [],
     })
     deadline = min(float(status["deadline_unix"]), args.until)
-    train_end = deadline - 3600  # One hour reserved for matched final evaluation.
+    status["deadline_unix"] = deadline
+    train_end = deadline - FINAL_RESERVE_SECONDS
+    status["search_version"] = 2
+    status["candidate_order"] = list(CANDIDATE_NAMES)
+    status.setdefault("promotion_two_seeds", getattr(args, "promotion_two_seeds", True))
+    status.setdefault("pilot_horizons", {})
 
     def update(phase):
         status.update(phase=phase, updated_at=utc())
@@ -321,139 +398,285 @@ def controller(args):
         report(status)
         print(f"{utc()} {phase}", flush=True)
 
+    def error(message):
+        if message not in status["errors"]:
+            status["errors"].append(message)
+
     def stage(task, name, until, **kwargs):
+        if time.time() >= min(until, deadline - 15):
+            error(f"{name}: skipped because its deadline has passed")
+            return 124
         update(name)
         code = execute(task, until=until, deadline=deadline,
                        log=campaign_dir / "logs" / f"{name}.log", **kwargs)
         if code != 0:
-            status["errors"].append(f"{name}: exit {code}; see stage log")
+            error(f"{name}: exit {code}; see stage log")
         return code
 
-    def evaluate(name, config, checkpoint, samples=2048, steps=32, seconds=900):
-        existing = next((v for v in status["evaluations"] if v["name"] == name), None)
-        if existing:
+    def evaluate(name, config, checkpoint, samples=2048, steps=32, seconds=900,
+                 seed=42, phase_deadline=None):
+        existing = next((value for value in status["evaluations"] if value["name"] == name), None)
+        if existing is not None:
+            if (existing.get("num_generated"), existing.get("ode_steps"), existing.get("seed", 42)) != (samples, steps, seed):
+                raise ValueError(f"stored evaluation protocol does not match {name}")
             return existing
         out = campaign_dir / "evaluation" / name
         result_path = out / "result.json"
-        until = min(time.time() + seconds, deadline - 90)
+        until = min(time.time() + seconds, deadline - 90,
+                    phase_deadline if phase_deadline is not None else deadline - 90)
         if until - time.time() < 60:
             return None
         code = stage("evaluate", name, until, config=config, checkpoint=checkpoint,
-                     run_dir=out, result=result_path, samples=samples, ode_steps=steps)
-        if code == 0 and result_path.exists():
-            result = read_json(result_path)
-            result.update(name=name, config=str(config), snapshot=str(checkpoint))
-            status["evaluations"].append(result)
-            update(name + "-complete")
-            return result
-        return None
+                     run_dir=out, result=result_path, samples=samples, ode_steps=steps, seed=seed)
+        if code != 0 or not result_path.exists():
+            error(f"{name}: no completed FID result")
+            return None
+        result = read_json(result_path)
+        if ((result.get("num_generated"), result.get("ode_steps"), result.get("seed", 42)) != (samples, steps, seed)
+                or not isinstance(result.get("fid"), (int, float)) or not math.isfinite(result["fid"])):
+            error(f"{name}: invalid FID result or mismatched evaluation protocol")
+            return None
+        result.update(name=name, config=str(config), snapshot=str(checkpoint), seed=seed)
+        status["evaluations"].append(result)
+        update(name + "-complete")
+        return result
 
-    for candidate_name in ("adm64", "adm96"):
-        run_dir = campaign_dir / candidate_name
+    def checkpoint_exists(run_dir):
+        return resolve_checkpoint_path(run_dir / "latest.pt").exists()
+
+    def train_phase(name, phase, target_seconds):
+        candidate = status["candidates"][name]
+        if candidate.get("failed"):
+            return False
+        run_dir, config = Path(candidate["run_dir"]), Path(candidate["config"])
+        complete_key, snapshot_key = f"{phase}_complete", f"{phase}_snapshot"
+        if candidate.get(complete_key) and candidate.get(snapshot_key) and Path(candidate[snapshot_key]).exists():
+            return True
+        used_key, active_key = f"{phase}_seconds_used", f"{phase}_active"
+        used = max(float(candidate.get(used_key, 0)), float(candidate.get(f"{phase}_seconds_credited", 0)))
+        # Recover credit if the parent died after the worker saved and before
+        # its phase bookkeeping completed. A stale run.json cannot add credit.
+        active = candidate.pop(active_key, None)
+        if active:
+            info = read_json(run_dir / "run.json", {})
+            if info.get("finished_at"):
+                finished = datetime.fromisoformat(info["finished_at"]).timestamp()
+                if finished >= active["started_at"]:
+                    used += max(0, min(finished, active["until"]) - active["started_at"])
+        candidate[used_key] = used
+        remaining = max(0, target_seconds - used)
+        if not candidate.get(complete_key) and remaining >= 30:
+            if time.time() >= train_end - 300:
+                return False
+            before = read_json(run_dir / "run.json", {}).get("completed_steps", 0)
+            started = time.time()
+            until = min(started + remaining, train_end - 120)
+            candidate[active_key] = {"started_at": started, "until": until, "before_steps": before}
+            code = None
+            try:
+                code = stage("train", name + f"-{phase}-train", until, config=config, run_dir=run_dir)
+            finally:
+                candidate[used_key] = used + max(0, min(time.time(), until) - started)
+                candidate.pop(active_key, None)
+                write_json(state_path, status)
+            info = read_json(run_dir / "run.json", {})
+            if code != 0 or info.get("stop_reason") in UNHEALTHY_STOPS:
+                candidate["failed"] = f"{phase} training failed: exit {code}, stop {info.get('stop_reason')}"
+                error(f"{name}: {candidate['failed']}")
+                update(name + f"-{phase}-failed")
+                return False
+            delta = int(info.get("completed_steps", 0)) - int(before)
+            if delta <= 0:
+                candidate["failed"] = f"{phase} made no optimizer progress"
+                error(f"{name}: {candidate['failed']}")
+                update(name + f"-{phase}-failed")
+                return False
+            elapsed = time.time() - started
+            if elapsed >= 300:
+                candidate["measured_seconds_per_step"] = elapsed / delta
+        if candidate.get(used_key, 0) < target_seconds - 30 and not candidate.get(complete_key):
+            error(f"{name}-{phase}: training budget ended before the full comparison phase")
+            return False
+        if not checkpoint_exists(run_dir):
+            error(f"{name}-{phase}: no resumable checkpoint")
+            return False
+        info = read_json(run_dir / "run.json", {})
+        if info.get("stop_reason") in UNHEALTHY_STOPS or info.get("completed_steps", 0) <= 0:
+            error(f"{name}-{phase}: checkpoint is not from healthy completed training")
+            return False
+        candidate[snapshot_key] = str(snapshot(run_dir / "latest.pt", run_dir / f"{phase}_ema.pt"))
+        candidate[complete_key] = True
+        candidate[f"{phase}_completed_steps"] = int(info["completed_steps"])
+        update(name + f"-{phase}-saved")
+        return True
+
+    # Benchmark each architecture once; LR variants share its throughput and
+    # pilot cosine horizon, so a later launch does not change the LR schedule.
+    for name in CANDIDATE_NAMES:
+        width = candidate_width(name)
+        run_dir = campaign_dir / name
         run_dir.mkdir(exist_ok=True)
-        template = ROOT / "configs" / f"campaign_{candidate_name}.yaml"
-        benchmark_result = run_dir / "benchmark.json"
+        template = ROOT / "configs" / f"campaign_{name}.yaml"
+        base_dir = campaign_dir / width
+        benchmark_result = base_dir / "benchmark.json"
         if not benchmark_result.exists():
-            code = stage("benchmark", candidate_name + "-benchmark", min(time.time()+600, train_end),
+            if name != width:
+                error(f"{name}: architecture benchmark unavailable")
+                continue
+            code = stage("benchmark", width + "-benchmark", min(time.time() + 600, train_end - 120),
                          config=template, result=benchmark_result)
             if code != 0:
                 continue
         bench = read_json(benchmark_result)
+        seconds_per_step = float(bench["seconds_per_step"])
+        if not math.isfinite(seconds_per_step) or seconds_per_step <= 0:
+            raise ValueError(f"invalid benchmark throughput: {width}")
         config_path = run_dir / "config.yaml"
+        if width not in status["pilot_horizons"]:
+            base_config = base_dir / "config.yaml"
+            status["pilot_horizons"][width] = (
+                int(yaml.safe_load(base_config.read_text())["training"]["num_steps"])
+                if base_config.exists() else max(2000, int(8 * 3600 / seconds_per_step))
+            )
         if not config_path.exists():
             config = yaml.safe_load(template.read_text())
-            # Budget a full winner run plus this candidate's screen. Leave one
-            # competing screen and evaluation overhead out of the LR horizon.
-            allocated = max(3600, train_end - time.time() - 2700 - 900)
-            config["training"]["num_steps"] = max(2000, int(allocated / bench["seconds_per_step"] * 1.03))
+            config["training"]["num_steps"] = status["pilot_horizons"][width]
             config_path.write_text(yaml.safe_dump(config, sort_keys=False))
-        status["candidates"][candidate_name] = {**status["candidates"].get(candidate_name, {}), "run_dir": str(run_dir), "config": str(config_path), "benchmark": bench}
-        update(candidate_name + "-ready")
-
+        status["candidates"][name] = {
+            **status["candidates"].get(name, {}), "run_dir": str(run_dir), "config": str(config_path),
+            "width": width, "benchmark": bench, "benchmark_source": str(benchmark_result),
+        }
+        update(name + "-ready")
     if not status["candidates"]:
-        raise RuntimeError("No candidate passed its benchmark")
+        raise RuntimeError("No candidate passed its architecture benchmark")
 
-    # Equal wall-clock screening. Each candidate retains its optimizer and EMA
-    # so the winner continues from its screen rather than starting over.
-    for name, candidate in status["candidates"].items():
-        run_dir, config = Path(candidate["run_dir"]), Path(candidate["config"])
-        if not candidate.get("screen_complete") and time.time() < train_end - 600:
-            screen_start = time.time()
-            screen_remaining = max(30, 2700 - candidate.get("screen_seconds_used", 0))
-            code = stage("train", name + "-screen-train", min(time.time()+screen_remaining, train_end-300),
-                         config=config, run_dir=run_dir)
-            candidate["screen_seconds_used"] = candidate.get("screen_seconds_used", 0) + time.time() - screen_start
-            if code == 0 and resolve_checkpoint_path(run_dir / "latest.pt").exists():
-                snapshot_path = snapshot(run_dir / "latest.pt", run_dir / "screen_ema.pt")
-                candidate["screen_complete"] = True
-                candidate["screen_snapshot"] = str(snapshot_path)
-                update(name + "-screen-saved")
-        if candidate.get("screen_complete"):
-            evaluate(name + "-screen", config, Path(candidate["screen_snapshot"]))
+    for name in CANDIDATE_NAMES:
+        if name not in status["candidates"]:
+            continue
+        candidate = status["candidates"][name]
+        if train_phase(name, "screen", SCREEN_SECONDS):
+            evaluate(name + "-screen", Path(candidate["config"]), Path(candidate["screen_snapshot"]),
+                     phase_deadline=train_end - 120)
 
-    valid = [v for v in status["evaluations"] if v["name"].endswith("-screen") and math.isfinite(v["fid"])]
+    if "promoted" not in status:
+        status["promoted"] = best_screen_per_width(status)
+        # Explicit fallback only when that width has healthy training but no FID.
+        for width in ("adm64", "adm96"):
+            if any(candidate_width(name) == width for name in status["promoted"]):
+                continue
+            healthy = [name for name in CANDIDATE_NAMES if name in status["candidates"]
+                       and candidate_width(name) == width and status["candidates"][name].get("screen_complete")
+                       and not status["candidates"][name].get("failed")]
+            if healthy:
+                status["promoted"].append(healthy[0])
+                error(f"{width}: screening FID unavailable; promoted first healthy learning rate")
+        update("promotion-candidates-selected")
+    promotion_seeds = PROMOTION_SEEDS if status["promotion_two_seeds"] else (42,)
+    for name in status["promoted"]:
+        candidate = status["candidates"][name]
+        if train_phase(name, "promotion", PROMOTION_SECONDS):
+            for seed in promotion_seeds:
+                suffix = "-promotion" if seed == 42 else f"-promotion-seed{seed}"
+                evaluate(name + suffix, Path(candidate["config"]), Path(candidate["promotion_snapshot"]),
+                         seed=seed, phase_deadline=train_end - 120)
+
     if not status.get("winner"):
-        if valid:
-            status["winner"] = min(valid, key=lambda v: v["fid"])["name"].removesuffix("-screen")
+        ranking, seeds = rank_promotions(status)
+        status["promotion_ranking_seeds"] = seeds
+        status["promotion_ranking"] = [{"name": name, "mean_fid": score} for score, name in ranking]
+        if ranking:
+            status["winner"] = ranking[0][1]
         else:
-            finished = [name for name, candidate in status["candidates"].items() if candidate.get("screen_complete")]
-            if not finished:
-                raise RuntimeError("No candidate completed training")
-            status["winner"] = finished[0]
-            status["errors"].append("Screening FID unavailable; defaulted to first healthy candidate")
+            healthy_screens = [value for value in status["evaluations"] if is_screening_result(value)
+                               and value["name"].endswith("-screen")
+                               and not status["candidates"].get(value["name"].removesuffix("-screen"), {}).get("failed")]
+            if healthy_screens:
+                status["winner"] = min(healthy_screens, key=lambda value: value["fid"])["name"].removesuffix("-screen")
+                error("Matched promotion FID unavailable; winner selected from seed-42 screening FID")
+            else:
+                healthy = [name for name, candidate in status["candidates"].items()
+                           if candidate.get("screen_complete") and not candidate.get("failed")]
+                if not healthy:
+                    raise RuntimeError("No healthy candidate completed training")
+                status["winner"] = healthy[0]
+                error("All selection FIDs unavailable; defaulted to first healthy candidate")
+        update("selected-" + status["winner"])
     winner = status["winner"]
     candidate = status["candidates"][winner]
-    run_dir, config = Path(candidate["run_dir"]), Path(candidate["config"])
-    update("selected-" + winner)
+    run_dir = Path(candidate["run_dir"])
+
+    # Reset only the LR schedule once for the winner. The trainer preserves all
+    # learned weights, optimizer moments, EMA and RNG when restart_id changes.
+    if not status.get("winner_config"):
+        config = yaml.safe_load(Path(candidate["config"]).read_text())
+        current_steps = int(read_json(run_dir / "run.json", {}).get("completed_steps", 0))
+        speed = float(candidate.get("measured_seconds_per_step", candidate["benchmark"]["seconds_per_step"]))
+        remaining = max(0, train_end - time.time() - 120)
+        config["training"]["num_steps"] = current_steps + max(1, int(remaining / speed * 0.97))
+        config["training"]["lr_warmup_steps"] = 0
+        config["training"]["scheduler_restart_id"] = "winner-final-cosine-v1"
+        final_config = run_dir / "winner_final_config.yaml"
+        final_config.write_text(yaml.safe_dump(config, sort_keys=False))
+        status["winner_config"] = str(final_config)
+        status["winner_schedule"] = {"start_step": current_steps, "estimated_seconds_per_step": speed,
+                                      "num_steps": config["training"]["num_steps"], "created_at": utc()}
+        update("winner-final-schedule-ready")
+    config = Path(status["winner_config"])
+    status.setdefault("round_snapshots", {})
+    # Finish an evaluation saved just before a previous controller interruption.
+    for round_name, saved_snapshot in status["round_snapshots"].items():
+        evaluate(round_name, config, Path(saved_snapshot), phase_deadline=train_end - 120)
     round_index = int(status.get("completed_rounds", 0))
     while time.time() < train_end - 300:
-        before_steps = read_json(run_dir / "run.json", {}).get("completed_steps", 0)
-        planned_steps = yaml.safe_load(config.read_text())["training"]["num_steps"]
-        if before_steps >= planned_steps:
+        before = int(read_json(run_dir / "run.json", {}).get("completed_steps", 0))
+        planned = int(yaml.safe_load(config.read_text())["training"]["num_steps"])
+        if before >= planned:
             break
         round_index += 1
-        code = stage("train", f"{winner}-round{round_index}-train", min(time.time()+7200, train_end-120),
+        round_name = f"{winner}-round{round_index}"
+        code = stage("train", round_name + "-train", min(time.time() + 7200, train_end - 120),
                      config=config, run_dir=run_dir)
-        if code != 0:
+        info = read_json(run_dir / "run.json", {})
+        if code != 0 or info.get("stop_reason") in UNHEALTHY_STOPS:
             break
-        after_steps = read_json(run_dir / "run.json", {}).get("completed_steps", 0)
-        if after_steps <= before_steps:
-            status["errors"].append(f"{winner}-round{round_index}: no optimizer progress; stopped retries")
+        if int(info.get("completed_steps", 0)) <= before:
+            error(f"{round_name}: no optimizer progress; stopped retries")
             break
         snap = snapshot(run_dir / "latest.pt", run_dir / f"round{round_index}_ema.pt")
-        evaluate(f"{winner}-round{round_index}", config, snap)
+        status["round_snapshots"][round_name] = str(snap)
         status["completed_rounds"] = round_index
-        update(f"{winner}-round{round_index}-complete")
-        current = read_json(run_dir / "run.json", {})
-        cfg = yaml.safe_load(config.read_text())
-        if current.get("completed_steps", 0) >= cfg["training"]["num_steps"]:
-            break
+        update(round_name + "-saved")
+        evaluate(round_name, config, snap, phase_deadline=train_end - 120)
+        update(round_name + "-complete")
 
-    # Include the fixed-validation best snapshot, which need not be the best FID.
     if resolve_checkpoint_path(run_dir / "best_val.pt").exists() and time.time() < deadline - 1800:
-        best = snapshot(run_dir / "best_val.pt", run_dir / "best_val_ema.pt")
-        evaluate(winner + "-best-val", config, best)
+        existing_best = status.get("best_val_snapshot")
+        best = Path(existing_best) if existing_best else snapshot(run_dir / "best_val.pt", run_dir / "best_val_ema.pt")
+        status["best_val_snapshot"] = str(best)
+        update("best-validation-snapshot-ready")
+        evaluate(winner + "-best-val", config, best, phase_deadline=deadline - 1800)
 
-    screening = [v for v in status["evaluations"] if v.get("num_generated") == 2048 and math.isfinite(v["fid"])]
-    finalists = sorted(screening, key=lambda v: v["fid"])[:2]
-    for index, candidate_result in enumerate(finalists):
+    # Seed-31415 promotion checks must never enter the seed-42 finalist pool.
+    screening = [value for value in status["evaluations"] if is_screening_result(value, seed=42)]
+    finalists = sorted(screening, key=lambda value: value["fid"])[:2]
+    for index, result in enumerate(finalists):
         if time.time() > deadline - 300:
             break
-        # First finalist gets up to 35 min, second uses remaining budget.
         available = deadline - 90 - time.time()
         seconds = min(2100, available) if index == 0 else available
-        evaluate(candidate_result["name"] + "-final10k", Path(candidate_result["config"]),
-                 Path(candidate_result["snapshot"]), samples=10000, steps=100, seconds=seconds)
-
-    final_results = [v for v in status["evaluations"] if v.get("num_generated") == 10000 and v.get("ode_steps") == 100 and math.isfinite(v["fid"])]
+        evaluate(result["name"] + "-final10k", Path(result["config"]), Path(result["snapshot"]),
+                 samples=10000, steps=100, seconds=seconds, seed=42)
+    final_results = [value for value in status["evaluations"]
+                     if value.get("num_generated") == 10000 and value.get("ode_steps") == 100
+                     and value.get("seed", 42) == 42 and math.isfinite(value.get("fid", float("nan")))]
     if final_results:
-        selected = min(final_results, key=lambda v: v["fid"])
-        status["selected_model"] = {k: selected[k] for k in ("name", "fid", "snapshot", "config", "checkpoint_step", "num_generated", "ode_steps")}
-        status["selected_model"]["selection_protocol"] = "matched 10k Euler100 FID among evaluated campaign finalists"
+        selected = min(final_results, key=lambda value: value["fid"])
+        status["selected_model"] = {key: selected[key] for key in ("name", "fid", "snapshot", "config", "checkpoint_step", "num_generated", "ode_steps")}
+        status["selected_model"]["selection_protocol"] = "matched seed-42 10k Euler100 FID among evaluated campaign finalists"
     elif screening:
-        selected = min(screening, key=lambda v: v["fid"])
-        status["selected_model"] = {k: selected[k] for k in ("name", "fid", "snapshot", "config", "checkpoint_step", "num_generated", "ode_steps")}
-        status["selected_model"]["selection_protocol"] = "provisional: screening FID only; final10k unavailable"
+        selected = min(screening, key=lambda value: value["fid"])
+        status["selected_model"] = {key: selected[key] for key in ("name", "fid", "snapshot", "config", "checkpoint_step", "num_generated", "ode_steps")}
+        status["selected_model"]["selection_protocol"] = "provisional: seed-42 screening FID only; final10k unavailable"
     if status.get("selected_model"):
         status["selected_model"]["sample_grid"] = export_samples(selected, campaign_dir / "selected_samples")
     baseline = read_json(LEGACY_REPORT, {})
@@ -483,6 +706,8 @@ def parse_args():
     parser.add_argument("--result", type=Path)
     parser.add_argument("--samples", type=int, default=2048)
     parser.add_argument("--ode-steps", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--promotion-two-seeds", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--publish-results", action="store_true")
     return parser.parse_args()
 

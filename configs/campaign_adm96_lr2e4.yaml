@@ -1,0 +1,44 @@
+# Same loss and optimization recipe, wider candidate for equal-time screening.
+model_type: adm
+adm_unet:
+  image_size: 64
+  in_channels: 3
+  model_channels: 96
+  channel_mult: [1, 2, 3, 4]
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]
+  num_heads: 4
+  dropout: 0.0
+  norm_groups: 32
+  time_scale: 1000.0
+unet:
+  in_channels: 3
+data:
+  dataset: celeba
+  image_size: 64
+  batch_size: 128
+  seed: 42
+  horizontal_flip: true
+training:
+  num_steps: 100000
+  optimizer: adamw
+  optimizer_betas: [0.9, 0.95]
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_schedule: cosine
+  lr_warmup_steps: 500
+  lr_min_ratio: 0.1
+  ema_decay: 0.9995
+  ema_warmup: true
+  mixed_precision: bf16
+  checkpoint_every: 1000
+  val_every: 500
+  val_batches: 16
+  plot_every: 1000
+sampling:
+  num_samples: 25
+  ode_steps: 100
+  n_plot_images: 8
+  n_plot_steps: 12
+  preview_ode_steps: 32

@@ -603,3 +603,66 @@ def test_checkpoint_resolver_rejects_unsafe_or_mismatched_pointer(tmp_path):
     pointer.write_text(json.dumps({"filename": "version.pt", "size_bytes": 4}))
     with pytest.raises(ValueError, match="size"):
         resolve_checkpoint_path(logical)
+
+
+def test_explicit_scheduler_restart_preserves_training_state_and_only_restarts_once(tmp_path):
+    torch.manual_seed(912)
+    path = _path()
+    checkpoint = tmp_path / "restart.pt"
+    common = dict(device=torch.device("cpu"), batch_size=4, ema_decay=0.9,
+                  val_every=0, plot_every=0, checkpoint_every=0, ckpt_path=checkpoint)
+    FlowTrainer(path, TinyFlow()).train(
+        num_steps=2, lr=1e-3, lr_schedule="cosine", scheduler_num_steps=8,
+        lr_warmup_steps=1, **common,
+    )
+    before = torch.load(checkpoint, weights_only=False)
+    restarted = FlowTrainer(path, TinyFlow())
+    restarted.train(
+        num_steps=6, lr=2e-4, lr_schedule="cosine", lr_min_ratio=0.1,
+        scheduler_restart_id="winner-v1", resume_from=checkpoint,
+        deadline_timestamp=0.0, **common,
+    )
+    after = torch.load(checkpoint, weights_only=False)
+    assert after["step"] == before["step"] == 2
+    assert after["scheduler_restart_id"] == "winner-v1"
+    assert after["scheduler"]["T_max"] == 4
+    assert after["scheduler"]["last_epoch"] == 0
+    assert after["optimizer"]["param_groups"][0]["lr"] == pytest.approx(2e-4)
+    for field in ("model", "ema_model", "history"):
+        for name in before[field]:
+            assert torch.equal(before[field][name], after[field][name])
+    for key in before["optimizer"]["state"]:
+        for name in before["optimizer"]["state"][key]:
+            assert torch.equal(before["optimizer"]["state"][key][name], after["optimizer"]["state"][key][name])
+    assert torch.equal(before["rng_state"]["cpu"], after["rng_state"]["cpu"])
+    full_checkpoint = tmp_path / "full_restarted.pt"
+    torch.save(after, full_checkpoint)
+    assert after["scheduler_restart_start_step"] == 2
+    assert after["scheduler_restart_end_step"] == 6
+    for end_step in (4, 6):
+        FlowTrainer(path, TinyFlow()).train(
+            num_steps=end_step, lr=2e-4, lr_schedule="cosine", lr_min_ratio=0.1,
+            scheduler_restart_id="winner-v1", resume_from=checkpoint, **common,
+        )
+    finished = torch.load(checkpoint, weights_only=False)
+    assert finished["step"] == 6
+    assert finished["scheduler"]["T_max"] == 4
+    assert finished["scheduler"]["last_epoch"] == 4
+    assert finished["optimizer"]["param_groups"][0]["lr"] == pytest.approx(2e-5)
+    assert all(float(value["step"]) == 6 for value in finished["optimizer"]["state"].values())
+
+    FlowTrainer(path, TinyFlow()).train(
+        num_steps=6, lr=2e-4, lr_schedule="cosine", lr_min_ratio=0.1,
+        scheduler_restart_id="winner-v1", resume_from=full_checkpoint,
+        **(common | {"ckpt_path": full_checkpoint}),
+    )
+    full = torch.load(full_checkpoint, weights_only=False)
+    for field in ("model", "ema_model", "history"):
+        for name in full[field]:
+            assert torch.equal(full[field][name], finished[field][name])
+    assert torch.equal(full["rng_state"]["cpu"], finished["rng_state"]["cpu"])
+    with pytest.raises(ValueError, match="requires a new scheduler_restart_id"):
+        FlowTrainer(path, TinyFlow()).train(
+            num_steps=8, lr=2e-4, lr_schedule="cosine", lr_min_ratio=0.1,
+            scheduler_restart_id="winner-v1", resume_from=checkpoint, **common,
+        )
