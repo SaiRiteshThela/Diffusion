@@ -1,10 +1,13 @@
+import json
 import math
 import os
+import re
 import shutil
 import signal
 import tempfile
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
@@ -60,6 +63,27 @@ def _isolated_seed(seed: int | None, device: torch.device):
         if devices:
             torch.cuda.manual_seed_all(seed)
         yield
+
+
+def resolve_checkpoint_path(path: str | Path) -> Path:
+    """Resolve an immutable checkpoint pointer, falling back to a legacy file.
+
+    Remote FUSE mounts can return stale bytes after replacing an existing large
+    file. Immutable versions avoid that; a small JSON pointer is authoritative.
+    """
+    logical = Path(path)
+    pointer = logical.with_name(logical.name + ".pointer.json")
+    if not pointer.exists():
+        return logical
+    metadata = json.loads(pointer.read_text())
+    filename = metadata["filename"]
+    if not isinstance(filename, str) or Path(filename).name != filename:
+        raise ValueError(f"checkpoint pointer must contain a local basename: {pointer}")
+    resolved = logical.parent / filename
+    size = resolved.stat().st_size
+    if size != metadata["size_bytes"]:
+        raise ValueError(f"checkpoint size does not match pointer: {resolved}")
+    return resolved
 
 
 def model_size_b(model: nn.Module) -> int:
@@ -267,7 +291,7 @@ class Trainer(ABC):
 
         if resume_from is not None:
             # Keep serialized model copies off GPU and release them after restoring.
-            state = torch.load(resume_from, map_location="cpu", weights_only=False)
+            state = torch.load(resolve_checkpoint_path(resume_from), map_location="cpu", weights_only=False)
             self.model.load_state_dict(state["model"])
             opt.load_state_dict(state["optimizer"])
             if scheduler is not None and state.get("scheduler") is not None:
@@ -373,6 +397,47 @@ class Trainer(ABC):
             destination_tmp = None
             try:
                 torch.save(payload, tmp_path)
+                if os.getenv("DIFFUSION_IMMUTABLE_CHECKPOINTS", "").lower() in {"1", "true", "yes"}:
+                    version = output.with_name(
+                        f"{output.stem}.step{step:09d}.{uuid.uuid4().hex}{output.suffix}"
+                    )
+                    # Never replace an existing large FUSE object. Even rename
+                    # can leave stale cached bytes under the destination path.
+                    shutil.copyfile(tmp_path, version)
+                    verified = torch.load(version, map_location="cpu", weights_only=False, mmap=True)
+                    if int(verified["step"]) != step or len(verified["history"]["train"]) != step:
+                        raise RuntimeError(f"published checkpoint failed step verification: {version}")
+                    del verified
+                    pointer = output.with_name(output.name + ".pointer.json")
+                    metadata = {
+                        "filename": version.name,
+                        "step": step,
+                        "size_bytes": version.stat().st_size,
+                        "created_at": time.time(),
+                    }
+                    # Directly overwrite the tiny pointer: replacing its inode
+                    # would reproduce the stale-name problem on these mounts.
+                    with pointer.open("w") as stream:
+                        json.dump(metadata, stream)
+                        stream.write("\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    keep = int(os.getenv("DIFFUSION_CHECKPOINT_KEEP", "0"))
+                    if keep > 0:
+                        pattern = re.compile(
+                            re.escape(output.stem) + r"\.step[0-9]{9}\.[0-9a-f]{32}" + re.escape(output.suffix)
+                        )
+                        versions = [
+                            path for path in output.parent.glob(f"{output.stem}.step*{output.suffix}")
+                            if pattern.fullmatch(path.name) and path != version
+                        ]
+                        versions.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+                        for obsolete in versions[max(0, keep - 1):]:
+                            try:
+                                obsolete.unlink(missing_ok=True)
+                            except OSError as exc:
+                                print(f"checkpoint cleanup skipped {obsolete}: {exc}")
+                    return
                 with tempfile.NamedTemporaryFile(
                     dir=output.parent, prefix=f".{output.name}.", suffix=".partial", delete=False
                 ) as destination:

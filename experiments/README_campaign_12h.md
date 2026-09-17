@@ -17,7 +17,7 @@ tail -f .training/a40-12h/controller.log
 
 Detach tmux with Ctrl-b, then d. The RunPod instance must remain running; disconnecting the client is fine.
 
-Runtime state is in `outputs/campaign_20260917/status.json`. Each candidate's `run.json` contains its W&B URL. Its `latest.pt` holds full optimizer/EMA/scheduler/RNG state; `best_val.pt` is selected using repeatable validation; `*_ema.pt` snapshots are inference-only. Final checkpoint selection and sample paths are written to `selected_model.json`.
+Runtime state is in `outputs/campaign_20260917/status.json`. Each candidate's `run.json` contains its W&B URL. Its `latest.pt.pointer.json` identifies the immutable file containing full optimizer/EMA/scheduler/RNG state; `best_val.pt.pointer.json` identifies the fixed-validation best. The last three versions per stream are retained. Inference snapshots have unique `*_ema.step*.pt` filenames. Immutable files avoid stale replaced-file reads observed on GeeseFS; `training.trainer.resolve_checkpoint_path` resolves a logical checkpoint name. Final checkpoint selection and sample paths are written to `selected_model.json`.
 
 ## Launch / recover
 

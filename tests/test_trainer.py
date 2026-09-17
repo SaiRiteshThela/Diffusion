@@ -533,3 +533,73 @@ def test_deadline_during_forward_finishes_update_and_skips_further_work(tmp_path
     assert saved["scheduler"]["last_epoch"] == 1
     assert saved["stop_reason"] == "deadline"
     assert all(float(item["step"]) == 1 for item in saved["optimizer"]["state"].values())
+
+
+def test_immutable_checkpoint_resolves_current_version_and_resumes(tmp_path, monkeypatch):
+    import json
+    from training.trainer import resolve_checkpoint_path
+
+    monkeypatch.setenv("DIFFUSION_IMMUTABLE_CHECKPOINTS", "1")
+    monkeypatch.setenv("DIFFUSION_CHECKPOINT_KEEP", "3")
+    checkpoint = tmp_path / "latest.pt"
+    # A stale legacy alias must never take precedence over its pointer.
+    checkpoint.write_bytes(b"stale legacy alias")
+    trainer = FlowTrainer(_path(), TinyFlow())
+    common = dict(device=torch.device("cpu"), batch_size=4, ckpt_path=checkpoint,
+                  val_every=0, plot_every=0, checkpoint_every=1)
+    trainer.train(num_steps=4, **common)
+    resolved = resolve_checkpoint_path(checkpoint)
+    assert resolved != checkpoint
+    saved = torch.load(resolved, map_location="cpu", weights_only=False)
+    assert saved["step"] == len(saved["history"]["train"]) == 4
+    assert checkpoint.read_bytes() == b"stale legacy alias"
+    versions = list(tmp_path.glob("latest.step*.pt"))
+    assert len(versions) == 3
+    pointer = json.loads((tmp_path / "latest.pt.pointer.json").read_text())
+    assert pointer["filename"] == resolved.name
+    assert pointer["size_bytes"] == resolved.stat().st_size
+    resumed = FlowTrainer(trainer.path, TinyFlow())
+    resumed.train(num_steps=5, resume_from=checkpoint, **common)
+    assert resumed.completed_steps == 5
+    assert torch.load(resolve_checkpoint_path(checkpoint), weights_only=False)["step"] == 5
+    assert len(list(tmp_path.glob("latest.step*.pt"))) == 3
+
+
+def test_immutable_checkpoint_failed_copy_preserves_authoritative_pointer(tmp_path, monkeypatch):
+    import training.trainer as trainer_module
+
+    monkeypatch.setenv("DIFFUSION_IMMUTABLE_CHECKPOINTS", "1")
+    checkpoint = tmp_path / "latest.pt"
+    trainer = FlowTrainer(_path(), TinyFlow())
+    common = dict(device=torch.device("cpu"), batch_size=4, ckpt_path=checkpoint,
+                  val_every=0, plot_every=0, checkpoint_every=0)
+    trainer.train(num_steps=1, **common)
+    old_resolved = trainer_module.resolve_checkpoint_path(checkpoint)
+    old_pointer = (tmp_path / "latest.pt.pointer.json").read_text()
+
+    def failing_copy(source, destination):
+        Path(destination).write_bytes(b"incomplete version")
+        raise OSError("simulated immutable copy failure")
+
+    monkeypatch.setattr(trainer_module.shutil, "copyfile", failing_copy)
+    with pytest.raises(OSError, match="immutable copy"):
+        trainer.train(num_steps=2, resume_from=checkpoint, **common)
+    assert (tmp_path / "latest.pt.pointer.json").read_text() == old_pointer
+    assert trainer_module.resolve_checkpoint_path(checkpoint) == old_resolved
+    assert torch.load(old_resolved, weights_only=False)["step"] == 1
+
+
+def test_checkpoint_resolver_rejects_unsafe_or_mismatched_pointer(tmp_path):
+    import json
+    from training.trainer import resolve_checkpoint_path
+
+    logical = tmp_path / "latest.pt"
+    assert resolve_checkpoint_path(logical) == logical
+    pointer = tmp_path / "latest.pt.pointer.json"
+    pointer.write_text(json.dumps({"filename": "../outside.pt", "size_bytes": 3}))
+    with pytest.raises(ValueError, match="basename"):
+        resolve_checkpoint_path(logical)
+    (tmp_path / "version.pt").write_bytes(b"abc")
+    pointer.write_text(json.dumps({"filename": "version.pt", "size_bytes": 4}))
+    with pytest.raises(ValueError, match="size"):
+        resolve_checkpoint_path(logical)

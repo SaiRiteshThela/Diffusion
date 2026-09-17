@@ -24,10 +24,6 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("DIFFUSION_CHECKPOINT_TMPDIR", "/dev/shm/diffusion-ckpts")
-os.environ.setdefault("OMP_NUM_THREADS", "8")
-os.environ.setdefault("MKL_NUM_THREADS", "8")
 CAMPAIGN = "campaign_20260917"
 DEFAULT_DIR = ROOT / "outputs" / CAMPAIGN
 DEFAULT_DEADLINE = datetime(2026, 9, 17, 15, 15, 44, tzinfo=timezone.utc).timestamp()
@@ -41,16 +37,38 @@ def utc(timestamp: float | None = None) -> str:
 
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".partial")
-    temporary.write_text(json.dumps(payload, indent=2, default=str) + "\n")
-    temporary.replace(path)
+    # GeeseFS can serve stale bytes after replacement; small metadata files
+    # are written through their existing inode, with readers retrying a race.
+    with path.open("w") as stream:
+        stream.write(json.dumps(payload, indent=2, default=str) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def read_json(path: Path, default=None):
-    return json.loads(path.read_text()) if path.exists() else default
+    if not path.exists():
+        return default
+    for attempt in range(4):
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            if attempt == 3:
+                raise
+            time.sleep(0.05)
+
+
+def configure_environment():
+    # Configure only an explicitly launched campaign, never unrelated imports.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("DIFFUSION_CHECKPOINT_TMPDIR", "/dev/shm/diffusion-ckpts")
+    os.environ.setdefault("DIFFUSION_IMMUTABLE_CHECKPOINTS", "1")
+    os.environ.setdefault("DIFFUSION_CHECKPOINT_KEEP", "3")
+    os.environ.setdefault("OMP_NUM_THREADS", "8")
+    os.environ.setdefault("MKL_NUM_THREADS", "8")
 
 
 def configure_torch():
+    configure_environment()
     import torch
     torch.set_num_threads(8)
     if not torch.cuda.is_available():
@@ -117,6 +135,7 @@ def train_worker(args):
     import wandb
     from models.config import load_config
     from experiments.run_experiment_6 import build_trainer, resolve_data_root
+    from training.trainer import resolve_checkpoint_path
     cfg = load_config(args.config)
     torch.manual_seed(cfg["data"]["seed"])
     trainer = build_trainer(cfg, args.config, resolve_data_root(), device)
@@ -161,7 +180,7 @@ def train_worker(args):
             plot_every=tr["plot_every"], plot_seed=42, n_sampling_steps=sp["preview_ode_steps"],
             n_plot_images=sp["n_plot_images"], n_plot_steps=sp["n_plot_steps"],
             samples_dir=run_dir / "previews", show_plots=False, wandb_run=run,
-            resume_from=latest if latest.exists() else None,
+            resume_from=resolve_checkpoint_path(latest) if resolve_checkpoint_path(latest).exists() else None,
             deadline_timestamp=args.until, handle_signals=True, abort_train_loss=10.0,
         )
         info.update({"finished_at": utc(), "completed_steps": trainer.completed_steps, "stop_reason": trainer.last_stop_reason,
@@ -188,20 +207,21 @@ def eval_worker(args):
 
 def snapshot(checkpoint: Path, destination: Path):
     import torch
+    from training.trainer import resolve_checkpoint_path
+    checkpoint = resolve_checkpoint_path(checkpoint)
     state = torch.load(checkpoint, map_location="cpu", mmap=True, weights_only=False)
     weights = state.get("ema_model") or state["model"]
     payload = {"model": weights, "ema_model": weights, "step": state["step"],
                "source_checkpoint": str(checkpoint), "inference_only": True}
+    destination = destination.with_name(f"{destination.stem}.step{state['step']:09d}.{uuid.uuid4().hex[:8]}.pt")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path("/dev/shm/diffusion-ckpts") / f"{CAMPAIGN}-{destination.name}"
     temporary.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, temporary)
     import shutil
-    partial = destination.with_suffix(".partial")
-    shutil.copyfile(temporary, partial)
-    partial.replace(destination)
+    shutil.copyfile(temporary, destination)
     temporary.unlink()
-    return int(state["step"])
+    return destination
 
 
 def export_samples(result: dict, destination: Path):
@@ -284,6 +304,7 @@ def report(status: dict):
 
 def controller(args):
     import yaml
+    from training.trainer import resolve_checkpoint_path
     campaign_dir = args.run_dir
     campaign_dir.mkdir(parents=True, exist_ok=True)
     state_path = campaign_dir / "status.json"
@@ -357,11 +378,13 @@ def controller(args):
     for name, candidate in status["candidates"].items():
         run_dir, config = Path(candidate["run_dir"]), Path(candidate["config"])
         if not candidate.get("screen_complete") and time.time() < train_end - 600:
-            code = stage("train", name + "-screen-train", min(time.time()+2700, train_end-300),
+            screen_start = time.time()
+            screen_remaining = max(30, 2700 - candidate.get("screen_seconds_used", 0))
+            code = stage("train", name + "-screen-train", min(time.time()+screen_remaining, train_end-300),
                          config=config, run_dir=run_dir)
-            if code == 0 and (run_dir / "latest.pt").exists():
-                snapshot_path = run_dir / "screen_ema.pt"
-                snapshot(run_dir / "latest.pt", snapshot_path)
+            candidate["screen_seconds_used"] = candidate.get("screen_seconds_used", 0) + time.time() - screen_start
+            if code == 0 and resolve_checkpoint_path(run_dir / "latest.pt").exists():
+                snapshot_path = snapshot(run_dir / "latest.pt", run_dir / "screen_ema.pt")
                 candidate["screen_complete"] = True
                 candidate["screen_snapshot"] = str(snapshot_path)
                 update(name + "-screen-saved")
@@ -397,8 +420,7 @@ def controller(args):
         if after_steps <= before_steps:
             status["errors"].append(f"{winner}-round{round_index}: no optimizer progress; stopped retries")
             break
-        snap = run_dir / f"round{round_index}_ema.pt"
-        snapshot(run_dir / "latest.pt", snap)
+        snap = snapshot(run_dir / "latest.pt", run_dir / f"round{round_index}_ema.pt")
         evaluate(f"{winner}-round{round_index}", config, snap)
         status["completed_rounds"] = round_index
         update(f"{winner}-round{round_index}-complete")
@@ -408,9 +430,8 @@ def controller(args):
             break
 
     # Include the fixed-validation best snapshot, which need not be the best FID.
-    if (run_dir / "best_val.pt").exists() and time.time() < deadline - 1800:
-        best = run_dir / "best_val_ema.pt"
-        snapshot(run_dir / "best_val.pt", best)
+    if resolve_checkpoint_path(run_dir / "best_val.pt").exists() and time.time() < deadline - 1800:
+        best = snapshot(run_dir / "best_val.pt", run_dir / "best_val_ema.pt")
         evaluate(winner + "-best-val", config, best)
 
     screening = [v for v in status["evaluations"] if v.get("num_generated") == 2048 and math.isfinite(v["fid"])]
@@ -467,6 +488,7 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    configure_environment()
     args = parse_args()
     if time.time() >= args.until:
         raise SystemExit("Deadline has already passed; refusing GPU work")
