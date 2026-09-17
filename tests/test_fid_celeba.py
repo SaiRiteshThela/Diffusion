@@ -178,3 +178,42 @@ def test_frechet_deadline_returns_same_small_result():
     result = frechet_with_deadline(np.zeros(3), np.eye(3), np.ones(3), np.eye(3),
                                    deadline_unix=time.time() + 30)
     assert result == pytest.approx(3.0)
+
+
+def test_immutable_generated_cache_retries_do_not_overwrite(tmp_path, monkeypatch):
+    from sampling.fid_celeba import (
+        cache_matches, publish_generated_cache, select_generated_path,
+    )
+
+    staging = tmp_path / 'local-stage'
+    monkeypatch.setenv('DIFFUSION_CHECKPOINT_TMPDIR', str(staging))
+    identity = {'num_samples': 2, 'ode_steps': 32, 'checkpoint': 'one'}
+    original = select_generated_path(tmp_path, identity)
+    original.write_bytes(b'interrupted copy without a manifest')
+    retry = select_generated_path(tmp_path, identity)
+    assert retry != original
+    images = torch.zeros(2, 3, 4, 4, dtype=torch.uint8)
+    publish_generated_cache(images, retry, identity)
+    assert original.read_bytes() == b'interrupted copy without a manifest'
+    assert cache_matches(retry, identity)
+    assert torch.equal(torch.load(retry, weights_only=True), images)
+    assert select_generated_path(tmp_path, identity) == retry
+    regenerated = select_generated_path(tmp_path, identity, regenerate=True)
+    assert regenerated not in {original, retry}
+    other = select_generated_path(tmp_path, identity | {'checkpoint': 'two'})
+    assert other not in {original, retry, regenerated}
+    assert list(staging.iterdir()) == []
+
+
+def test_generated_publication_refuses_existing_destination(tmp_path, monkeypatch):
+    from sampling.fid_celeba import manifest_path, publish_generated_cache
+
+    staging = tmp_path / 'local-stage'
+    monkeypatch.setenv('DIFFUSION_CHECKPOINT_TMPDIR', str(staging))
+    destination = tmp_path / 'existing.pt'
+    destination.write_bytes(b'keep these existing bytes')
+    with pytest.raises(FileExistsError):
+        publish_generated_cache(torch.zeros(2), destination, {'num_samples': 2, 'ode_steps': 32})
+    assert destination.read_bytes() == b'keep these existing bytes'
+    assert not manifest_path(destination).exists()
+    assert list(staging.iterdir()) == []

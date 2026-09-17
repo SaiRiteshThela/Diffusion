@@ -11,7 +11,11 @@ import gc
 import hashlib
 import json
 import multiprocessing as mp
+import os
+import shutil
+import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +72,48 @@ def write_manifest(path: Path, identity: dict[str, Any], **provenance: Any) -> N
     temporary = metadata_path.with_suffix(metadata_path.suffix + ".partial")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(metadata_path)
+
+
+
+def select_generated_path(
+    output_dir: Path, identity: dict[str, Any], *, regenerate: bool = False,
+) -> Path:
+    """Reuse a verified immutable object, or choose a filename never overwritten."""
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    stem = f"generated_uint8_n{identity['num_samples']}_steps{identity['ode_steps']}_{digest}"
+    base = output_dir / f"{stem}.pt"
+    if not regenerate:
+        candidates = sorted(output_dir.glob(f"{stem}*.pt"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        for candidate in candidates:
+            if cache_matches(candidate, identity):
+                return candidate
+        if not base.exists():
+            return base
+    return output_dir / f"{stem}_{uuid.uuid4().hex}.pt"
+
+
+def publish_generated_cache(
+    images: Tensor, destination: Path, identity: dict[str, Any],
+    deadline_unix: float | None = None,
+) -> None:
+    """Stage the torch archive locally and exclusively publish a new FUSE object."""
+    check_deadline(deadline_unix)
+    temporary_dir = Path(os.getenv("DIFFUSION_CHECKPOINT_TMPDIR", "/dev/shm/diffusion-ckpts"))
+    temporary_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=temporary_dir, prefix="generated-", suffix=".partial", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        torch.save(images, temporary)
+        check_deadline(deadline_unix)
+        # Exclusive creation prevents any retry from replacing a visible object.
+        with temporary.open("rb") as source, destination.open("xb") as target:
+            shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+        if destination.stat().st_size != temporary.stat().st_size:
+            raise OSError(f"incomplete generated-cache copy: {destination}")
+        check_deadline(deadline_unix)
+        write_manifest(destination, identity)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def generated_cache_identity(
@@ -416,7 +462,6 @@ def evaluate_checkpoint(
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
     output_dir.mkdir(parents=True, exist_ok=True)
-    generated_path = output_dir / f"generated_uint8_n{num_samples}_steps{ode_steps}.pt"
     real_stats_path = Path(real_stats_path) if real_stats_path else output_dir / f"celeba_{real_split}_{image_size}_stats.npz"
     real_identity = real_cache_identity(cache_path, real_split, image_size)
     real_stats = None
@@ -451,6 +496,7 @@ def evaluate_checkpoint(
             seed=seed, use_ema=actual_ema, image_size=image_size, channels=channels,
             batch_size=batch_size, precision="bf16-forward/fp32-Euler/channels-last",
         )
+        generated_path = select_generated_path(output_dir, identity, regenerate=regenerate)
         print(f"checkpoint {checkpoint_path} step {checkpoint_step} ema {actual_ema} batch {batch_size} Euler {ode_steps}", flush=True)
         if not regenerate and cache_matches(generated_path, identity):
             generated = torch.load(generated_path, map_location="cpu", weights_only=True, mmap=True)
@@ -462,8 +508,7 @@ def evaluate_checkpoint(
                 device, seed, deadline_unix,
             )
             check_deadline(deadline_unix)
-            torch.save(generated, generated_path)
-            write_manifest(generated_path, identity)
+            publish_generated_cache(generated, generated_path, identity, deadline_unix)
     finally:
         del model
         gc.collect()
