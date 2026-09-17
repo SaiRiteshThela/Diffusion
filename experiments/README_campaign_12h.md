@@ -1,5 +1,10 @@
 # Twelve-hour A40 campaign
 
+The campaign is complete. The selected ADM64 checkpoint at step 66,500 achieved
+FID **6.382** with 10,000 samples and 100 Euler steps.
+See the [results report](../reports/campaign_20260917.md).
+W&B links remain in ignored local runtime files and are excluded from public reports.
+
 The campaign screens six configurations: two unconditional ADM-style U-Net widths (23.0M and 51.8M parameters), each at peak learning rates 1e-4, 2e-4, and 3e-4. It keeps the existing independent Gaussian pairing, uniform time sampling, straight-line path, velocity MSE, and CelebA crop178/resize64 preprocessing. It does not resume or overwrite Experiment 6.
 
 Training uses BF16 forwards with FP32 velocity MSE, channels-last convolution, AdamW, gradient clipping, cosine learning rate, and warm-started EMA. Each of the six configurations receives a 25-minute pilot, with existing training time credited. The best learning rate for each width receives a further 45 minutes. The controller then continues the stronger finalist in resumable segments for the remaining training budget, roughly six hours after screening and evaluation overhead. Candidate comparisons use 2,048-sample Euler32 FID. The final 60 minutes are reserved for 10,000-sample Euler100 evaluation; the original deadline remains fixed. Screening FID must only be compared to results with the same sample count and solver budget. The final report distinguishes the previously recorded Experiment 5 baseline from newly computed scores.

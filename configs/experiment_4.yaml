@@ -2,7 +2,7 @@
 # stepped learning-rate decay plus EMA weights.
 
 source:
-  baseline_run: private-wandb-run
+  baseline_experiment: 3
   target_val_loss: 0.12398386746644974
 
 time_embedding:

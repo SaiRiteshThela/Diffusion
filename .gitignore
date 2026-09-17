@@ -19,21 +19,20 @@ env/
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
 
-# Datasets
-data/raw/*
-data/processed/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
+# Datasets (directories or persistent-storage symlinks)
+/data/raw
+/data/processed
 
 # Training artifacts
-checkpoints/*
-!checkpoints/.gitkeep
-samples/*
-!samples/.gitkeep
+/checkpoints
+/samples
+/outputs
 logs/
 runs/
 wandb/
 lightning_logs/
+.pytest_cache/
+*.log
 
 # Model weights
 *.pt

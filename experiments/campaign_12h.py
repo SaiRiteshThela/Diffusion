@@ -350,11 +350,10 @@ def report(status: dict):
              f"Hard deadline: {utc(status['deadline_unix'])}", "",
              "Loss unchanged: uniform t; x_t = t*x + (1-t)*noise; velocity MSE against x-noise.",
              "Data unchanged: unconditional CelebA, crop178, resize64, horizontal flips, [-1,1].", "",
-             "## Candidates", "", "| Candidate | Parameters | Step seconds | W&B |", "|---|---:|---:|---|"]
+             "## Candidates", "", "| Candidate | Parameters | Step seconds |", "|---|---:|---:|"]
     for name, candidate in status.get("candidates", {}).items():
         bench = candidate.get("benchmark", {})
-        info = read_json(Path(candidate["run_dir"]) / "run.json", {})
-        lines.append(f"| {name} | {bench.get('parameters', '')} | {bench.get('seconds_per_step', '')} | {info.get('wandb_url', '')} |")
+        lines.append(f"| {name} | {bench.get('parameters', '')} | {bench.get('seconds_per_step', '')} |")
     lines.extend(["", "Six 25-minute pilots: widths 64/96 × learning rates 1e-4/2e-4/3e-4. The best learning rate per width receives 45 more minutes; the winner uses the remaining training budget.",
                   "", "## Evaluations", "", "| Candidate/checkpoint | Samples | Euler updates | Seed | FID |", "|---|---:|---:|---:|---:|"])
     for result in status.get("evaluations", []):

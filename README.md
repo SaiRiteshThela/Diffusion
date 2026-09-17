@@ -1,17 +1,28 @@
 # Diffusion
 
-An unconditional MNIST flow-matching experiment built with PyTorch and a custom
-U-Net.
+Unconditional flow matching for MNIST and 64×64 CelebA, built with PyTorch
+and custom or ADM-style U-Nets.
+
+The completed A40 campaign selected a **23.03M-parameter ADM64 model** with
+**FID 6.382** at step 66,500, evaluated using 10,000 EMA samples and 100 Euler
+steps against CelebA training-set statistics (crop178/resize64).
+See the [results for all six runs](reports/campaign_20260917.md)
+and the [campaign instructions](experiments/README_campaign_12h.md).
 
 ## Structure
 
 - `models/` — U-Net, attention, residual blocks, and continuous-time embeddings
-- `datasets/` — cached MNIST sampler with train/validation/test splits
+- `datasets/` — cached MNIST and CelebA samplers with dataset splits
 - `training/` — Gaussian probability path and conditional flow-matching trainer
 - `sampling/` — ODE interfaces and Euler integration
 - `configs/` — model configurations
 - `tests/` — unit and integration tests
 - `experiments/` — numbered experiment notebooks
+- `reports/` — experiment results
+
+Git tracks source code, configurations, cleared notebooks, and reports.
+Datasets, weights, generated samples, logs, and persistent-storage symlinks
+are excluded.
 
 ## Setup
 
